@@ -205,7 +205,7 @@ FROM
 			PS.[object_id]
 			,PS.[index_id]
 	) PSA ON I.[index_id] = PSA.[index_id] AND I.[object_id] = PSA.[object_id]
-	LEFT JOIN sys.dm_db_index_usage_stats IUS ON I.[object_id] = IUS.[object_id] AND I.[index_id] = IUS.[index_id]
+	LEFT JOIN sys.dm_db_index_usage_stats IUS ON I.[object_id] = IUS.[object_id] AND I.[index_id] = IUS.[index_id] AND IUS.[database_id] = DB_ID()
 	OUTER APPLY sys.dm_db_index_operational_stats(DB_ID(), I.[object_id], I.[index_id], DEFAULT) IOS
 WHERE
 	I.[object_id] = @object_id
