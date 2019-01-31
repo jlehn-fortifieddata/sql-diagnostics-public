@@ -1,5 +1,5 @@
-DECLARE @SchemaName sysname = N'Sales';  -- Sales, Sales, Sales
-DECLARE @ObjectName sysname = N'OrderLines';  -- Invoices, SpecialDeals_HEAP, Orders
+DECLARE @SchemaName sysname = N'dbo';  -- Sales, Sales, Sales
+DECLARE @ObjectName sysname = N'BankTransactions';  -- Invoices, SpecialDeals_HEAP, Orders
 
 -- Variables to hold lookup information for later.
 DECLARE @schema_id int;
@@ -39,8 +39,6 @@ SELECT
 	,T.[lock_escalation_desc]
 	,T.[durability]
 	,T.[durability_desc]
-	,T.[temporal_type]
-	,T.[temporal_type_desc]
 FROM
 	[sys].[tables] T
 WHERE
@@ -283,7 +281,7 @@ SELECT
 	,I.[name] AS [constraint_index_name]
 	,NULL AS [delete_action]
 	,NULL AS [update_action]
-	,CASE WHEN I.[is_disabled] = 1 THEN 'Disabled' ELSE 'Enabled' END AS [is_enabled]
+	,CASE WHEN I.[is_disabled] = 1 THEN 0 ELSE 1 END AS [is_enabled]
 	,NULL AS [is_for_replication]
 	,NULL AS [is_trusted]
 	,NULL AS [constraint_definition]
