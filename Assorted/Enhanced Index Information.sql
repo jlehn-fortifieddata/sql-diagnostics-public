@@ -122,6 +122,7 @@ SELECT
 	--,I.[has_filter]
 	,I.[filter_definition]
 	,PSA.[partition_count]
+	,PSA.[row_count]
 	,PSA.[reserved_page_count] * 8192.0 / 1024.0 / 1024.0 AS [reserved_mb]
 	,PSA.[used_page_count] * 8192.0 / 1024.0 / 1024.0 AS [used_mb]
 	,PSA.[reserved_page_count] * 8192.0 / 1024.0 / 1024.0 / 1024.0 AS [reserved_gb]
@@ -197,6 +198,7 @@ FROM
 			,COUNT(1) AS [partition_count]
 			,SUM(PS.[reserved_page_count]) AS [reserved_page_count]
 			,SUM(PS.[used_page_count]) AS [used_page_count]
+			,SUM(PS.[row_count]) AS [row_count]
 		FROM
 			sys.dm_db_partition_stats PS
 		GROUP BY
