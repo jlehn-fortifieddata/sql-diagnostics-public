@@ -3,12 +3,13 @@ The SummarizedPlanCache CTE will get all statements from the plan cache as well 
 The FilteredCacheSummary CTE will cut SummarizedPlanCache down to only the rows that we need.  In the final SELECT, we will
 join to sys.dm_exec_sql_text again later on to get the query text.
 */
-DECLARE @TopResults INT = 500;
+DECLARE @TopResults INT = 50;
 
 ;WITH SummarizedPlanCache AS
 (
 	SELECT
-		QS.[sql_handle]
+		QS.[plan_handle]
+		,QS.[sql_handle]
 		,QS.statement_start_offset
 		,QS.statement_end_offset
 		,QS.query_hash
@@ -54,7 +55,8 @@ DECLARE @TopResults INT = 500;
 	FROM
 		sys.dm_exec_query_stats QS
 	GROUP BY
-		QS.[sql_handle]
+		QS.[plan_handle]
+		,QS.[sql_handle]
 		,QS.statement_start_offset
 		,QS.statement_end_offset
 		,QS.query_hash
@@ -151,9 +153,11 @@ SELECT
 	,FCS.percent_total_rows
 	,FCS.query_hash
 	,FCS.query_plan_hash
+	,EQP.query_plan
 FROM
 	FilteredCacheSummary FCS
 	CROSS APPLY sys.dm_exec_sql_text(FCS.[sql_handle]) ST
 	LEFT JOIN sys.databases D ON ST.[dbid] = D.database_id
+	CROSS APPLY sys.dm_exec_query_plan(FCS.[plan_handle]) EQP
 ORDER BY
 	FCS.total_worker_time DESC;
