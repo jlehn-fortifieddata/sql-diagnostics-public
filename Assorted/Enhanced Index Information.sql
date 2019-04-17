@@ -467,6 +467,9 @@ FROM
 WHERE
 	MID.[database_id] = DB_ID()
 	AND MID.[object_id] = @object_id
+ORDER BY
+	CONVERT(decimal(18,2), MIGS.user_seeks * MIGS.avg_total_user_cost * (MIGS.avg_user_impact * 0.01)) DESC;
+									     
 
 EndExecution:
 PRINT 'Execution completed.';
