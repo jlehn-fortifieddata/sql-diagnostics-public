@@ -1,5 +1,5 @@
 DECLARE @SchemaName sysname = N'dbo';  -- Sales, Sales, Sales
-DECLARE @ObjectName sysname = N'BankTransactions';  -- Invoices, SpecialDeals_HEAP, Orders
+DECLARE @ObjectName sysname = N'AlertItems';  -- Invoices, SpecialDeals_HEAP, Orders
 
 -- Variables to hold lookup information for later.
 DECLARE @schema_id int;
@@ -37,8 +37,8 @@ SELECT
 	,T.[is_tracked_by_cdc]
 	,T.[lock_escalation]
 	,T.[lock_escalation_desc]
-	,T.[durability]
-	,T.[durability_desc]
+	--,T.[durability]
+	--,T.[durability_desc]
 FROM
 	[sys].[tables] T
 WHERE
@@ -211,6 +211,38 @@ WHERE
 	I.[object_id] = @object_id
 ORDER BY
 	I.[index_id];
+
+-- Statistics information.
+SELECT 
+	S.[auto_created]
+	,S.[name] as [statistics_name]
+	,STUFF((
+		SELECT
+			', ' + C.[name]
+		FROM
+			[sys].[stats_columns] AS SC
+			JOIN [sys].[columns] AS C ON SC.[column_id] = C.[column_id] AND SC.[object_id] = C.[object_id]
+		WHERE
+			SC.[stats_id] = S.[stats_id]
+			AND SC.[object_id] = S.[object_id]
+		ORDER BY
+			SC.[stats_column_id]
+		FOR XML PATH(''), TYPE
+	).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS stat_cols
+	,S.[filter_definition]
+	,S.[is_temporary]
+	,S.[no_recompute]
+	,SP.[last_updated]
+	,SP.[modification_counter]
+	,SP.[rows]
+	,SP.[rows_sampled]
+FROM
+	[sys].[stats] S
+	CROSS APPLY [sys].[dm_db_stats_properties] (S.[object_id], S.[stats_id]) AS SP
+WHERE 
+	S.[object_id] = @object_id
+ORDER BY
+	S.[name];
 
 -- Get information about primary keys and unique constraints.
 SELECT
