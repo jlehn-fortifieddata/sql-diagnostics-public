@@ -70,6 +70,10 @@ SELECT
 	,I.index_id
 	,I.[type_desc]
 	,P.[data_compression_desc]
+	,SUM(PS.used_page_count) * 8 / 1024.0 AS UsedSizeMB
+	,SUM(PS.reserved_page_count) * 8 / 1024.0 AS ReservedSizeMB
+	,COUNT(*) AS [Partitions]
+	,SUM(PS.row_count) AS [Rows]
 	,SUM(PS.in_row_data_page_count) * 8 / 1024.0 AS InRowDataMB
 	,SUM(PS.in_row_used_page_count) * 8 / 1024.0 AS InRowUsedMB
 	,SUM(PS.in_row_reserved_page_count) * 8 / 1024.0 AS InRowReservedMB
@@ -77,10 +81,6 @@ SELECT
 	,SUM(PS.lob_reserved_page_count) * 8 / 1024.0 AS LOBReservedMB
 	,SUM(PS.row_overflow_used_page_count) * 8 / 1024.0 AS RowOverflowUsedMB
 	,SUM(PS.row_overflow_reserved_page_count) * 8 / 1024.0 AS RowOverflowReservedMB
-	,SUM(PS.used_page_count) * 8 / 1024.0 AS UsedSizeMB
-	,SUM(PS.reserved_page_count) * 8 / 1024.0 AS ReservedSizeMB
-	,COUNT(*) AS [Partitions]
-	,SUM(PS.row_count) AS [Rows]
 FROM
 	sys.schemas S
 	JOIN sys.tables T ON S.[schema_id] = T.[schema_id]
