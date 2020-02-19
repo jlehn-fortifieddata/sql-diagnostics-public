@@ -1,0 +1,4 @@
+$Context = New-azStorageContext -StorageAccountName colres83defa -StorageAccountKey Jt8VXIv7UVytJt6HF6bIoRgRZ+LaLNP09N1pkp+iy3b+r7xiob4H9aOyicfKHvTr+Hrw/e4zE0F6t5eU/U5Txg==
+"tst.txt" | ForEach-Object {
+	Get-AzStorageBlobContent -Context $Context -Container "files" -Blob $_ -Destination "c:\fortifieddata" -Force
+}
