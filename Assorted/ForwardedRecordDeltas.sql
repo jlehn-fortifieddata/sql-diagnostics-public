@@ -82,10 +82,10 @@ BEGIN
 			,COALESCE(SUM(PS.row_count), 0) AS [RowCount]
 			,COALESCE(IOS.forwarded_fetch_count, 0) AS ForwardedFetchCount
 		FROM
-			' + @CurrentDatabaseName + N'.sys.schemas S
-			JOIN ' + @CurrentDatabaseName + N'.sys.tables T ON S.[schema_id] = T.[schema_id]
-			JOIN ' + @CurrentDatabaseName + N'.sys.indexes I ON T.[object_id] = I.[object_id]
-			JOIN ' + @CurrentDatabaseName + N'.sys.dm_db_partition_stats PS ON I.[object_id] = PS.[object_id] AND I.[index_id] = PS.[index_id]
+			[' + @CurrentDatabaseName + N'].sys.schemas S
+			JOIN [' + @CurrentDatabaseName + N'].sys.tables T ON S.[schema_id] = T.[schema_id]
+			JOIN [' + @CurrentDatabaseName + N'].sys.indexes I ON T.[object_id] = I.[object_id]
+			JOIN [' + @CurrentDatabaseName + N'].sys.dm_db_partition_stats PS ON I.[object_id] = PS.[object_id] AND I.[index_id] = PS.[index_id]
 			--OUTER APPLY sys.dm_db_index_operational_stats(' + CAST(@CurrentDatabaseId AS nvarchar(20)) + N', T.[object_id], I.[index_id], NULL) IOS
 			LEFT JOIN sys.dm_db_index_operational_stats(' + CAST(@CurrentDatabaseId AS nvarchar(20)) + N', NULL, NULL, NULL) IOS ON T.[object_id] = IOS.[object_id] AND I.[index_id] = IOS.[index_id]
 		WHERE
@@ -159,10 +159,10 @@ BEGIN
 			,COALESCE(SUM(PS.row_count), 0) AS [RowCount]
 			,COALESCE(IOS.forwarded_fetch_count, 0) AS ForwardedFetchCount
 		FROM
-			' + @CurrentDatabaseName + N'.sys.schemas S
-			JOIN ' + @CurrentDatabaseName + N'.sys.tables T ON S.[schema_id] = T.[schema_id]
-			JOIN ' + @CurrentDatabaseName + N'.sys.indexes I ON T.[object_id] = I.[object_id]
-			JOIN ' + @CurrentDatabaseName + N'.sys.dm_db_partition_stats PS ON I.[object_id] = PS.[object_id] AND I.[index_id] = PS.[index_id]
+			[' + @CurrentDatabaseName + N'].sys.schemas S
+			JOIN [' + @CurrentDatabaseName + N'].sys.tables T ON S.[schema_id] = T.[schema_id]
+			JOIN [' + @CurrentDatabaseName + N'].sys.indexes I ON T.[object_id] = I.[object_id]
+			JOIN [' + @CurrentDatabaseName + N'].sys.dm_db_partition_stats PS ON I.[object_id] = PS.[object_id] AND I.[index_id] = PS.[index_id]
 			--OUTER APPLY sys.dm_db_index_operational_stats(' + CAST(@CurrentDatabaseId AS nvarchar(20)) + N', T.[object_id], I.[index_id], NULL) IOS
 			LEFT JOIN sys.dm_db_index_operational_stats(' + CAST(@CurrentDatabaseId AS nvarchar(20)) + N', NULL, NULL, NULL) IOS ON T.[object_id] = IOS.[object_id] AND I.[index_id] = IOS.[index_id]
 		WHERE
