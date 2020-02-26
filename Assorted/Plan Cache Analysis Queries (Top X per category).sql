@@ -178,13 +178,15 @@ SELECT
 	,FCS.total_elapsed_time_rank
 	,FCS.query_hash
 	,FCS.query_plan_hash
-	,EQP.query_plan
+	--,EQP.query_plan -- entire batch plan
+	,CAST(EQP.query_plan AS xml) AS query_plan -- single statement plan
 --INTO
 --	FDDBA.dbo.ZD88261_TopPlanCacheQueries_20190711
 FROM
 	FilteredCacheSummary FCS
-	CROSS APPLY sys.dm_exec_sql_text(FCS.[sql_handle]) ST
+	OUTER APPLY sys.dm_exec_sql_text(FCS.[sql_handle]) ST
 	LEFT JOIN sys.databases D ON ST.[dbid] = D.database_id
-	CROSS APPLY sys.dm_exec_query_plan(FCS.[plan_handle]) EQP
+	--OUTER APPLY sys.dm_exec_query_plan(FCS.[plan_handle]) EQP -- entire batch plan
+	OUTER APPLY sys.dm_exec_text_query_plan(FCS.[plan_handle], FCS.[statement_start_offset], FCS.[statement_end_offset]) EQP
 ORDER BY
 	FCS.total_worker_time DESC;
