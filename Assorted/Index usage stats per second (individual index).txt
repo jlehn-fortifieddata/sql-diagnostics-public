@@ -1,0 +1,52 @@
+DECLARE @StartTime datetime = GETDATE();
+DECLARE @DurationMinutes int = 10;
+
+SELECT
+	GETDATE() AS [timestamp]
+	,S.[name] AS [schema_name]
+	,T.[name] AS [table_name]
+	,I.[name] AS [index_name]
+	,IOS.*
+INTO
+	#TempStats
+FROM
+	[sys].[schemas] S
+	JOIN [sys].[tables] T ON S.[schema_id] = T.[schema_id]
+	JOIN [sys].[indexes] I ON T.[object_id] = I.[object_id]
+	OUTER APPLY [sys].[dm_db_index_operational_stats](DB_ID(), I.[object_id], I.[index_id], 0) IOS
+WHERE
+	S.[name] = 'dbo'
+	AND T.[name] = 'DriverAssignment'
+	AND I.[index_id] = 1;
+
+WHILE (GETDATE() < DATEADD(MINUTE, @DurationMinutes, @StartTime))
+BEGIN
+	WAITFOR DELAY '00:00:01';
+
+	INSERT INTO
+		#TempStats
+	SELECT
+		GETDATE() AS [timestamp]
+		,S.[name] AS [schema_name]
+		,T.[name] AS [table_name]
+		,I.[name] AS [index_name]
+		,IOS.*
+	FROM
+		[sys].[schemas] S
+		JOIN [sys].[tables] T ON S.[schema_id] = T.[schema_id]
+		JOIN [sys].[indexes] I ON T.[object_id] = I.[object_id]
+		OUTER APPLY [sys].[dm_db_index_operational_stats](DB_ID(), I.[object_id], I.[index_id], 0) IOS
+	WHERE
+		S.[name] = 'schema'
+		AND T.[name] = 'table'
+		AND I.[index_id] = 1;
+END
+
+SELECT
+	*
+FROM
+	#TempStats TS
+ORDER BY
+	TS.[timestamp];
+
+--DROP TABLE #TempStats;
