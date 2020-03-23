@@ -1,0 +1,60 @@
+DECLARE @Output varchar(1000) = '';
+DECLARE @CreateSchedule bit = 0;
+​
+IF (NOT EXISTS
+		(
+			SELECT
+				1
+			FROM
+				msdb.dbo.sysjobs J
+			WHERE
+				J.[name] = 'FD - Monitor Agent Job History Purge'
+		)
+	)
+BEGIN
+	SET @Output = 'The ''FD - Monitor Agent Job History Purge'' job does not exist.';
+	GOTO EndExecution;
+END
+​
+IF (NOT EXISTS
+		(
+			SELECT
+				1
+			FROM
+				msdb.dbo.sysjobs J
+				JOIN msdb.dbo.sysjobschedules JS ON J.[job_id] = JS.[job_id]
+				JOIN msdb.dbo.sysschedules S ON JS.[schedule_id] = S.[schedule_id]
+			WHERE
+				J.[name] = 'FD - Monitor Agent Job History Purge'
+				AND S.[enabled] = 1
+		)
+	)
+BEGIN
+	SET @Output = 'The ''FD - Monitor Agent Job History Purge'' job does not have a schedule, or the schedule is not enabled.';
+​
+	IF (@CreateSchedule = 1)
+	BEGIN
+		EXEC msdb.dbo.sp_add_jobschedule @job_name = 'FD - Monitor Agent Job History Purge', @name=N'Daily', 
+			@enabled=1, 
+			@freq_type=4, 
+			@freq_interval=1, 
+			@freq_subday_type=1, 
+			@freq_subday_interval=0, 
+			@freq_relative_interval=0, 
+			@freq_recurrence_factor=0, 
+			@active_start_date=20200323, 
+			@active_end_date=99991231, 
+			@active_start_time=1000, 
+			@active_end_time=235959;
+​
+		SET @Output = 'The job schedule has been created.';
+	END
+​
+	GOTO EndExecution;
+END
+​
+SET @Output = 'The job exists and is scheduled.';
+​
+EndExecution:
+SELECT
+	@Output;
