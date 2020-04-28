@@ -1,5 +1,5 @@
 DECLARE @SchemaName sysname = N'dbo';  -- Sales, Sales, Sales
-DECLARE @ObjectName sysname = N'AlertItems';  -- Invoices, SpecialDeals_HEAP, Orders
+DECLARE @ObjectName sysname = N'Enrollment_History';  -- Invoices, SpecialDeals_HEAP, Orders
 
 -- Variables to hold lookup information for later.
 DECLARE @schema_id int;
@@ -206,7 +206,8 @@ FROM
 			,PS.[index_id]
 	) PSA ON I.[index_id] = PSA.[index_id] AND I.[object_id] = PSA.[object_id]
 	LEFT JOIN sys.dm_db_index_usage_stats IUS ON I.[object_id] = IUS.[object_id] AND I.[index_id] = IUS.[index_id] AND IUS.[database_id] = DB_ID()
-	OUTER APPLY sys.dm_db_index_operational_stats(DB_ID(), I.[object_id], I.[index_id], DEFAULT) IOS
+	--OUTER APPLY sys.dm_db_index_operational_stats(DB_ID(), I.[object_id], I.[index_id], DEFAULT) IOS
+	LEFT JOIN sys.dm_db_index_operational_stats(DB_ID(), DEFAULT, DEFAULT, DEFAULT) IOS ON I.[object_id] = IOS.[object_id] AND I.[index_id] = IOS.[index_id]
 WHERE
 	I.[object_id] = @object_id
 ORDER BY
@@ -230,7 +231,7 @@ SELECT
 		FOR XML PATH(''), TYPE
 	).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS stat_cols
 	,S.[filter_definition]
-	,S.[is_temporary]
+	--,S.[is_temporary]
 	,S.[no_recompute]
 	,SP.[last_updated]
 	,SP.[modification_counter]
