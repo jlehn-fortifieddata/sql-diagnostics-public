@@ -1,6 +1,7 @@
 DECLARE @DatabaseName nvarchar(128) = N'TestDB';
 DECLARE @SchemaName nvarchar(128) = N'dbo';
 DECLARE @ObjectName nvarchar(128) = N'TestObject';
+DECLARE @TopResults int = 50;
 
 DECLARE @FullyQualifiedObjectName nvarchar(2000) =  N'[' + @DatabaseName + '].[' + @SchemaName + '].[' + @ObjectName + ']';
 DECLARE @DatabaseId smallint = DB_ID(@DatabaseName);
@@ -47,12 +48,21 @@ WHERE
 	--AND EPS.database_id = @DatabaseId
 	--AND EPS.object_id = @ObjectId
 )
-SELECT TOP (50)
-	AG.*
+,AggregatedDataFiltered AS
+(
+	SELECT TOP (@TopResults)
+		*
+	FROM
+		AggregatedData AG
+	ORDER BY
+		AG.[avg_executions_per_min] DESC
+)
+SELECT
+	AGF.*
 	,TRY_CAST(EQP.[query_plan] AS XML) AS [query_plan]
 FROM
-	AggregatedData AG
-	OUTER APPLY sys.dm_exec_query_plan(AG.[plan_handle]) EQP
+	AggregatedDataFiltered AGF
+	OUTER APPLY sys.dm_exec_query_plan(AGF.[plan_handle]) EQP
 ORDER BY
-	AG.[avg_executions_per_min] DESC;
+	AGF.[avg_executions_per_min] DESC;
 
