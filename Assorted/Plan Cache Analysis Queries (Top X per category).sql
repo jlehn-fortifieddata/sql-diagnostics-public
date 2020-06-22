@@ -179,7 +179,7 @@ SELECT
 	,FCS.query_hash
 	,FCS.query_plan_hash
 	--,EQP.query_plan -- entire batch plan
-	,CAST(EQP.query_plan AS xml) AS query_plan -- single statement plan
+	,TRY_CAST(EQP.query_plan AS xml) AS query_plan -- single statement plan
 --INTO
 --	FDDBA.dbo.ZD88261_TopPlanCacheQueries_20190711
 FROM
