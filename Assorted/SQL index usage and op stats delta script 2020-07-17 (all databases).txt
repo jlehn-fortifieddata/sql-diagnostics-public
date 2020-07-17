@@ -1,0 +1,494 @@
+USE [master];
+
+-- Script to check deltas for index usage/operational stats.
+DECLARE @DeltaDelay datetime = '00:00:10';
+
+-- Create tables to hold schema/object/index information from master, then truncate for later use.
+SELECT
+	DB_ID() AS [database_id]
+	,S.*
+INTO
+	#AllSchemas
+FROM
+	[sys].[schemas] S;
+
+TRUNCATE TABLE #AllSchemas;
+
+SELECT
+	DB_ID() AS [database_id]
+	,T.*
+INTO
+	#AllTables
+FROM
+	[sys].[tables] T;
+
+TRUNCATE TABLE #AllTables;
+
+SELECT
+	DB_ID() AS [database_id]
+	,I.*
+INTO
+	#AllIndexes
+FROM
+	[sys].[indexes] I;
+
+TRUNCATE TABLE #AllIndexes;
+
+-- Gather schema/object/index information from each database.
+DECLARE DatabaseCursor CURSOR LOCAL FAST_FORWARD FOR
+SELECT
+	D.[database_id]
+	,D.[name]
+FROM
+	[sys].[databases] D
+WHERE
+	D.[name] NOT IN (N'master', N'model', N'msdb', N'tempdb')
+	AND D.[state_desc] = 'ONLINE'
+ORDER BY
+	D.[name];
+
+DECLARE @CurrentDatabaseId int;
+DECLARE @CurrentDatabaseName sysname;
+DECLARE @ExecuteSQL nvarchar(max);
+
+OPEN DatabaseCursor;
+
+FETCH
+	DatabaseCursor
+INTO
+	@CurrentDatabaseId
+	,@CurrentDatabaseName;
+
+WHILE (@@FETCH_STATUS = 0)
+BEGIN
+	SET @ExecuteSQL = N'
+		INSERT INTO
+			#AllSchemas
+		SELECT
+			###DATABASE_ID### AS [database_id]
+			,S.*
+		FROM
+			[###DATABASE_NAME###].[sys].[schemas] S;
+
+		INSERT INTO
+			#AllTables
+		SELECT
+			###DATABASE_ID### AS [database_id]
+			,T.*
+		FROM
+			[###DATABASE_NAME###].[sys].[tables] T;
+
+		INSERT INTO
+			#AllIndexes
+		SELECT
+			###DATABASE_ID### AS [database_id]
+			,I.*
+		FROM
+			[###DATABASE_NAME###].[sys].[indexes] I;
+	';
+
+	SET @ExecuteSQL = REPLACE(@ExecuteSQL, N'###DATABASE_ID###', CAST(@CurrentDatabaseId AS nvarchar(20)));
+	SET @ExecuteSQL = REPLACE(@ExecuteSQL, N'###DATABASE_NAME###', @CurrentDatabaseName);
+
+	--PRINT @ExecuteSQL;
+
+	EXECUTE sp_executesql @ExecuteSQL;
+
+	FETCH
+		DatabaseCursor
+	INTO
+		@CurrentDatabaseId
+		,@CurrentDatabaseName;
+END
+
+CLOSE DatabaseCursor;
+DEALLOCATE DatabaseCursor;
+
+
+
+-- Gather initial index usage stats.
+SELECT
+	*
+INTO
+	#IndexUsagePreDelta
+FROM
+	sys.dm_db_index_usage_stats X;
+
+-- Gather initial index operational stats.
+SELECT
+	*
+INTO
+	#IndexOpPreDelta
+FROM
+	sys.dm_db_index_operational_stats(DEFAULT, DEFAULT, DEFAULT, DEFAULT) X;
+
+WAITFOR DELAY @DeltaDelay;
+
+-- Gather index usage stats again.
+SELECT
+	*
+INTO
+	#IndexUsagePostDelta
+FROM
+	sys.dm_db_index_usage_stats X;
+
+-- Gather index operational stats again.
+SELECT
+	*
+INTO
+	#IndexOpPostDelta
+FROM
+	sys.dm_db_index_operational_stats(DEFAULT, DEFAULT, DEFAULT, DEFAULT) X;
+
+;WITH IndexUsageDeltas AS
+(
+	SELECT
+		I2.database_id
+		,I2.[object_id]
+		,I2.index_id
+		,I2.user_seeks
+		,CASE WHEN COALESCE(I2.user_seeks, 0) >= COALESCE(I1.user_seeks, 0) THEN COALESCE(I2.user_seeks, 0) - COALESCE(I1.user_seeks, 0) ELSE COALESCE(I2.user_seeks, 0) END AS user_seeks_delta
+		,I2.last_user_seek
+		,I2.user_scans
+		,CASE WHEN COALESCE(I2.user_scans, 0) >= COALESCE(I1.user_scans, 0) THEN COALESCE(I2.user_scans, 0) - COALESCE(I1.user_scans, 0) ELSE COALESCE(I2.user_scans, 0) END AS user_scans_delta
+		,I2.last_user_scan
+		,I2.user_lookups
+		,CASE WHEN COALESCE(I2.user_lookups, 0) >= COALESCE(I1.user_lookups, 0) THEN COALESCE(I2.user_lookups, 0) - COALESCE(I1.user_lookups, 0) ELSE COALESCE(I2.user_lookups, 0) END AS user_lookups_delta
+		,I2.last_user_lookup
+		,I2.user_updates
+		,CASE WHEN COALESCE(I2.user_updates, 0) >= COALESCE(I1.user_updates, 0) THEN COALESCE(I2.user_updates, 0) - COALESCE(I1.user_updates, 0) ELSE COALESCE(I2.user_updates, 0) END AS user_updates_delta
+		,I2.last_user_update
+		,I2.system_seeks
+		,CASE WHEN COALESCE(I2.system_seeks, 0) >= COALESCE(I1.system_seeks, 0) THEN COALESCE(I2.system_seeks, 0) - COALESCE(I1.system_seeks, 0) ELSE COALESCE(I2.system_seeks, 0) END AS system_seeks_delta
+		,I2.last_system_seek
+		,I2.system_scans
+		,CASE WHEN COALESCE(I2.system_scans, 0) >= COALESCE(I1.system_scans, 0) THEN COALESCE(I2.system_scans, 0) - COALESCE(I1.system_scans, 0) ELSE COALESCE(I2.system_scans, 0) END AS system_scans_delta
+		,I2.last_system_scan
+		,I2.system_lookups
+		,CASE WHEN COALESCE(I2.system_lookups, 0) >= COALESCE(I1.system_lookups, 0) THEN COALESCE(I2.system_lookups, 0) - COALESCE(I1.system_lookups, 0) ELSE COALESCE(I2.system_lookups, 0) END AS system_lookups_delta
+		,I2.last_system_lookup
+		,I2.system_updates
+		,CASE WHEN COALESCE(I2.system_updates, 0) >= COALESCE(I1.system_updates, 0) THEN COALESCE(I2.system_updates, 0) - COALESCE(I1.system_updates, 0) ELSE COALESCE(I2.system_updates, 0) END AS system_updates_delta
+		,I2.last_system_update
+	FROM
+		#IndexUsagePostDelta I2
+		LEFT JOIN #IndexUsagePreDelta I1 ON I1.database_id = I2.database_id AND I1.[object_id] = I2.[object_id] AND I1.index_id = I2.index_id
+)
+,IndexOpDeltas AS
+(
+	SELECT
+		I2.database_id
+		,I2.[object_id]
+		,I2.index_id
+		,I2.leaf_insert_count
+		,CASE WHEN COALESCE(I2.leaf_insert_count, 0) >= COALESCE(I1.leaf_insert_count, 0) THEN COALESCE(I2.leaf_insert_count, 0) - COALESCE(I1.leaf_insert_count, 0) ELSE COALESCE(I2.leaf_insert_count, 0) END AS leaf_insert_count_delta
+		,I2.leaf_delete_count
+		,CASE WHEN COALESCE(I2.leaf_delete_count, 0) >= COALESCE(I1.leaf_delete_count, 0) THEN COALESCE(I2.leaf_delete_count, 0) - COALESCE(I1.leaf_delete_count, 0) ELSE COALESCE(I2.leaf_delete_count, 0) END AS leaf_delete_count_delta
+		,I2.leaf_update_count
+		,CASE WHEN COALESCE(I2.leaf_update_count, 0) >= COALESCE(I1.leaf_update_count, 0) THEN COALESCE(I2.leaf_update_count, 0) - COALESCE(I1.leaf_update_count, 0) ELSE COALESCE(I2.leaf_update_count, 0) END AS leaf_update_count_delta
+		,I2.leaf_ghost_count
+		,CASE WHEN COALESCE(I2.leaf_ghost_count, 0) >= COALESCE(I1.leaf_ghost_count, 0) THEN COALESCE(I2.leaf_ghost_count, 0) - COALESCE(I1.leaf_ghost_count, 0) ELSE COALESCE(I2.leaf_ghost_count, 0) END AS leaf_ghost_count_delta
+		,I2.nonleaf_insert_count
+		,CASE WHEN COALESCE(I2.nonleaf_insert_count, 0) >= COALESCE(I1.nonleaf_insert_count, 0) THEN COALESCE(I2.nonleaf_insert_count, 0) - COALESCE(I1.nonleaf_insert_count, 0) ELSE COALESCE(I2.nonleaf_insert_count, 0) END AS nonleaf_insert_count_delta
+		,I2.nonleaf_delete_count
+		,CASE WHEN COALESCE(I2.nonleaf_delete_count, 0) >= COALESCE(I1.nonleaf_delete_count, 0) THEN COALESCE(I2.nonleaf_delete_count, 0) - COALESCE(I1.nonleaf_delete_count, 0) ELSE COALESCE(I2.nonleaf_delete_count, 0) END AS nonleaf_delete_count_delta
+		,I2.nonleaf_update_count
+		,CASE WHEN COALESCE(I2.nonleaf_update_count, 0) >= COALESCE(I1.nonleaf_update_count, 0) THEN COALESCE(I2.nonleaf_update_count, 0) - COALESCE(I1.nonleaf_update_count, 0) ELSE COALESCE(I2.nonleaf_update_count, 0) END AS nonleaf_update_count_delta
+		,I2.leaf_allocation_count
+		,CASE WHEN COALESCE(I2.leaf_allocation_count, 0) >= COALESCE(I1.leaf_allocation_count, 0) THEN COALESCE(I2.leaf_allocation_count, 0) - COALESCE(I1.leaf_allocation_count, 0) ELSE COALESCE(I2.leaf_allocation_count, 0) END AS leaf_allocation_count_delta
+		,I2.nonleaf_allocation_count
+		,CASE WHEN COALESCE(I2.nonleaf_allocation_count, 0) >= COALESCE(I1.nonleaf_allocation_count, 0) THEN COALESCE(I2.nonleaf_allocation_count, 0) - COALESCE(I1.nonleaf_allocation_count, 0) ELSE COALESCE(I2.nonleaf_allocation_count, 0) END AS nonleaf_allocation_count_delta
+		,I2.leaf_page_merge_count
+		,CASE WHEN COALESCE(I2.leaf_page_merge_count, 0) >= COALESCE(I1.leaf_page_merge_count, 0) THEN COALESCE(I2.leaf_page_merge_count, 0) - COALESCE(I1.leaf_page_merge_count, 0) ELSE COALESCE(I2.leaf_page_merge_count, 0) END AS leaf_page_merge_count_delta
+		,I2.nonleaf_page_merge_count
+		,CASE WHEN COALESCE(I2.nonleaf_page_merge_count, 0) >= COALESCE(I1.nonleaf_page_merge_count, 0) THEN COALESCE(I2.nonleaf_page_merge_count, 0) - COALESCE(I1.nonleaf_page_merge_count, 0) ELSE COALESCE(I2.nonleaf_page_merge_count, 0) END AS nonleaf_page_merge_count_delta
+		,I2.range_scan_count
+		,CASE WHEN COALESCE(I2.range_scan_count, 0) >= COALESCE(I1.range_scan_count, 0) THEN COALESCE(I2.range_scan_count, 0) - COALESCE(I1.range_scan_count, 0) ELSE COALESCE(I2.range_scan_count, 0) END AS range_scan_count_delta
+		,I2.singleton_lookup_count
+		,CASE WHEN COALESCE(I2.singleton_lookup_count, 0) >= COALESCE(I1.singleton_lookup_count, 0) THEN COALESCE(I2.singleton_lookup_count, 0) - COALESCE(I1.singleton_lookup_count, 0) ELSE COALESCE(I2.singleton_lookup_count, 0) END AS singleton_lookup_count_delta
+		,I2.forwarded_fetch_count
+		,CASE WHEN COALESCE(I2.forwarded_fetch_count, 0) >= COALESCE(I1.forwarded_fetch_count, 0) THEN COALESCE(I2.forwarded_fetch_count, 0) - COALESCE(I1.forwarded_fetch_count, 0) ELSE COALESCE(I2.forwarded_fetch_count, 0) END AS forwarded_fetch_count_delta
+		,I2.lob_fetch_in_pages
+		,CASE WHEN COALESCE(I2.lob_fetch_in_pages, 0) >= COALESCE(I1.lob_fetch_in_pages, 0) THEN COALESCE(I2.lob_fetch_in_pages, 0) - COALESCE(I1.lob_fetch_in_pages, 0) ELSE COALESCE(I2.lob_fetch_in_pages, 0) END AS lob_fetch_in_pages_delta
+		,I2.lob_fetch_in_bytes
+		,CASE WHEN COALESCE(I2.lob_fetch_in_bytes, 0) >= COALESCE(I1.lob_fetch_in_bytes, 0) THEN COALESCE(I2.lob_fetch_in_bytes, 0) - COALESCE(I1.lob_fetch_in_bytes, 0) ELSE COALESCE(I2.lob_fetch_in_bytes, 0) END AS lob_fetch_in_bytes_delta
+		,I2.lob_orphan_create_count
+		,CASE WHEN COALESCE(I2.lob_orphan_create_count, 0) >= COALESCE(I1.lob_orphan_create_count, 0) THEN COALESCE(I2.lob_orphan_create_count, 0) - COALESCE(I1.lob_orphan_create_count, 0) ELSE COALESCE(I2.lob_orphan_create_count, 0) END AS lob_orphan_create_count_delta
+		,I2.lob_orphan_insert_count
+		,CASE WHEN COALESCE(I2.lob_orphan_insert_count, 0) >= COALESCE(I1.lob_orphan_insert_count, 0) THEN COALESCE(I2.lob_orphan_insert_count, 0) - COALESCE(I1.lob_orphan_insert_count, 0) ELSE COALESCE(I2.lob_orphan_insert_count, 0) END AS lob_orphan_insert_count_delta
+		,I2.row_overflow_fetch_in_pages
+		,CASE WHEN COALESCE(I2.row_overflow_fetch_in_pages, 0) >= COALESCE(I1.row_overflow_fetch_in_pages, 0) THEN COALESCE(I2.row_overflow_fetch_in_pages, 0) - COALESCE(I1.row_overflow_fetch_in_pages, 0) ELSE COALESCE(I2.row_overflow_fetch_in_pages, 0) END AS row_overflow_fetch_in_pages_delta
+		,I2.row_overflow_fetch_in_bytes
+		,CASE WHEN COALESCE(I2.row_overflow_fetch_in_bytes, 0) >= COALESCE(I1.row_overflow_fetch_in_bytes, 0) THEN COALESCE(I2.row_overflow_fetch_in_bytes, 0) - COALESCE(I1.row_overflow_fetch_in_bytes, 0) ELSE COALESCE(I2.row_overflow_fetch_in_bytes, 0) END AS row_overflow_fetch_in_bytes_delta
+		,I2.column_value_push_off_row_count
+		,CASE WHEN COALESCE(I2.column_value_push_off_row_count, 0) >= COALESCE(I1.column_value_push_off_row_count, 0) THEN COALESCE(I2.column_value_push_off_row_count, 0) - COALESCE(I1.column_value_push_off_row_count, 0) ELSE COALESCE(I2.column_value_push_off_row_count, 0) END AS column_value_push_off_row_count_delta
+		,I2.column_value_pull_in_row_count
+		,CASE WHEN COALESCE(I2.column_value_pull_in_row_count, 0) >= COALESCE(I1.column_value_pull_in_row_count, 0) THEN COALESCE(I2.column_value_pull_in_row_count, 0) - COALESCE(I1.column_value_pull_in_row_count, 0) ELSE COALESCE(I2.column_value_pull_in_row_count, 0) END AS column_value_pull_in_row_count_delta
+		,I2.row_lock_count
+		,CASE WHEN COALESCE(I2.row_lock_count, 0) >= COALESCE(I1.row_lock_count, 0) THEN COALESCE(I2.row_lock_count, 0) - COALESCE(I1.row_lock_count, 0) ELSE COALESCE(I2.row_lock_count, 0) END AS row_lock_count_delta
+		,I2.row_lock_wait_count
+		,CASE WHEN COALESCE(I2.row_lock_wait_count, 0) >= COALESCE(I1.row_lock_wait_count, 0) THEN COALESCE(I2.row_lock_wait_count, 0) - COALESCE(I1.row_lock_wait_count, 0) ELSE COALESCE(I2.row_lock_wait_count, 0) END AS row_lock_wait_count_delta
+		,I2.row_lock_wait_in_ms
+		,CASE WHEN COALESCE(I2.row_lock_wait_in_ms, 0) >= COALESCE(I1.row_lock_wait_in_ms, 0) THEN COALESCE(I2.row_lock_wait_in_ms, 0) - COALESCE(I1.row_lock_wait_in_ms, 0) ELSE COALESCE(I2.row_lock_wait_in_ms, 0) END AS row_lock_wait_in_ms_delta
+		,I2.page_lock_count
+		,CASE WHEN COALESCE(I2.page_lock_count, 0) >= COALESCE(I1.page_lock_count, 0) THEN COALESCE(I2.page_lock_count, 0) - COALESCE(I1.page_lock_count, 0) ELSE COALESCE(I2.page_lock_count, 0) END AS page_lock_count_delta
+		,I2.page_lock_wait_count
+		,CASE WHEN COALESCE(I2.page_lock_wait_count, 0) >= COALESCE(I1.page_lock_wait_count, 0) THEN COALESCE(I2.page_lock_wait_count, 0) - COALESCE(I1.page_lock_wait_count, 0) ELSE COALESCE(I2.page_lock_wait_count, 0) END AS page_lock_wait_count_delta
+		,I2.page_lock_wait_in_ms
+		,CASE WHEN COALESCE(I2.page_lock_wait_in_ms, 0) >= COALESCE(I1.page_lock_wait_in_ms, 0) THEN COALESCE(I2.page_lock_wait_in_ms, 0) - COALESCE(I1.page_lock_wait_in_ms, 0) ELSE COALESCE(I2.page_lock_wait_in_ms, 0) END AS page_lock_wait_in_ms_delta
+		,I2.index_lock_promotion_attempt_count
+		,CASE WHEN COALESCE(I2.index_lock_promotion_attempt_count, 0) >= COALESCE(I1.index_lock_promotion_attempt_count, 0) THEN COALESCE(I2.index_lock_promotion_attempt_count, 0) - COALESCE(I1.index_lock_promotion_attempt_count, 0) ELSE COALESCE(I2.index_lock_promotion_attempt_count, 0) END AS index_lock_promotion_attempt_count_delta
+		,I2.index_lock_promotion_count
+		,CASE WHEN COALESCE(I2.index_lock_promotion_count, 0) >= COALESCE(I1.index_lock_promotion_count, 0) THEN COALESCE(I2.index_lock_promotion_count, 0) - COALESCE(I1.index_lock_promotion_count, 0) ELSE COALESCE(I2.index_lock_promotion_count, 0) END AS index_lock_promotion_count_delta
+		,I2.page_latch_wait_count
+		,CASE WHEN COALESCE(I2.page_latch_wait_count, 0) >= COALESCE(I1.page_latch_wait_count, 0) THEN COALESCE(I2.page_latch_wait_count, 0) - COALESCE(I1.page_latch_wait_count, 0) ELSE COALESCE(I2.page_latch_wait_count, 0) END AS page_latch_wait_count_delta
+		,I2.page_latch_wait_in_ms
+		,CASE WHEN COALESCE(I2.page_latch_wait_in_ms, 0) >= COALESCE(I1.page_latch_wait_in_ms, 0) THEN COALESCE(I2.page_latch_wait_in_ms, 0) - COALESCE(I1.page_latch_wait_in_ms, 0) ELSE COALESCE(I2.page_latch_wait_in_ms, 0) END AS page_latch_wait_in_ms_delta
+		,I2.page_io_latch_wait_count
+		,CASE WHEN COALESCE(I2.page_io_latch_wait_count, 0) >= COALESCE(I1.page_io_latch_wait_count, 0) THEN COALESCE(I2.page_io_latch_wait_count, 0) - COALESCE(I1.page_io_latch_wait_count, 0) ELSE COALESCE(I2.page_io_latch_wait_count, 0) END AS page_io_latch_wait_count_delta
+		,I2.page_io_latch_wait_in_ms
+		,CASE WHEN COALESCE(I2.page_io_latch_wait_in_ms, 0) >= COALESCE(I1.page_io_latch_wait_in_ms, 0) THEN COALESCE(I2.page_io_latch_wait_in_ms, 0) - COALESCE(I1.page_io_latch_wait_in_ms, 0) ELSE COALESCE(I2.page_io_latch_wait_in_ms, 0) END AS page_io_latch_wait_in_ms_delta
+		,I2.tree_page_latch_wait_count
+		,CASE WHEN COALESCE(I2.tree_page_latch_wait_count, 0) >= COALESCE(I1.tree_page_latch_wait_count, 0) THEN COALESCE(I2.tree_page_latch_wait_count, 0) - COALESCE(I1.tree_page_latch_wait_count, 0) ELSE COALESCE(I2.tree_page_latch_wait_count, 0) END AS tree_page_latch_wait_count_delta
+		,I2.tree_page_latch_wait_in_ms
+		,CASE WHEN COALESCE(I2.tree_page_latch_wait_in_ms, 0) >= COALESCE(I1.tree_page_latch_wait_in_ms, 0) THEN COALESCE(I2.tree_page_latch_wait_in_ms, 0) - COALESCE(I1.tree_page_latch_wait_in_ms, 0) ELSE COALESCE(I2.tree_page_latch_wait_in_ms, 0) END AS tree_page_latch_wait_in_ms_delta
+		,I2.tree_page_io_latch_wait_count
+		,CASE WHEN COALESCE(I2.tree_page_io_latch_wait_count, 0) >= COALESCE(I1.tree_page_io_latch_wait_count, 0) THEN COALESCE(I2.tree_page_io_latch_wait_count, 0) - COALESCE(I1.tree_page_io_latch_wait_count, 0) ELSE COALESCE(I2.tree_page_io_latch_wait_count, 0) END AS tree_page_io_latch_wait_count_delta
+		,I2.tree_page_io_latch_wait_in_ms
+		,CASE WHEN COALESCE(I2.tree_page_io_latch_wait_in_ms, 0) >= COALESCE(I1.tree_page_io_latch_wait_in_ms, 0) THEN COALESCE(I2.tree_page_io_latch_wait_in_ms, 0) - COALESCE(I1.tree_page_io_latch_wait_in_ms, 0) ELSE COALESCE(I2.tree_page_io_latch_wait_in_ms, 0) END AS tree_page_io_latch_wait_in_ms_delta
+		,I2.page_compression_attempt_count
+		,CASE WHEN COALESCE(I2.page_compression_attempt_count, 0) >= COALESCE(I1.page_compression_attempt_count, 0) THEN COALESCE(I2.page_compression_attempt_count, 0) - COALESCE(I1.page_compression_attempt_count, 0) ELSE COALESCE(I2.page_compression_attempt_count, 0) END AS page_compression_attempt_count_delta
+		,I2.page_compression_success_count
+		,CASE WHEN COALESCE(I2.page_compression_success_count, 0) >= COALESCE(I1.page_compression_success_count, 0) THEN COALESCE(I2.page_compression_success_count, 0) - COALESCE(I1.page_compression_success_count, 0) ELSE COALESCE(I2.page_compression_success_count, 0) END AS page_compression_success_count_delta
+	FROM
+		#IndexOpPostDelta I2
+		LEFT JOIN #IndexOpPreDelta I1 ON I1.database_id = I2.database_id AND I1.[object_id] = I2.[object_id] AND I1.index_id = I2.index_id
+)
+,IndexOpTotalDeltas AS
+(
+	SELECT
+		IOD.database_id
+		,IOD.[object_id]
+		,IOD.index_id
+		,SUM(IOD.leaf_insert_count) AS leaf_insert_count
+		,SUM(IOD.leaf_insert_count_delta) AS leaf_insert_count_delta
+		,SUM(IOD.leaf_delete_count) AS leaf_delete_count
+		,SUM(IOD.leaf_delete_count_delta) AS leaf_delete_count_delta
+		,SUM(IOD.leaf_update_count) AS leaf_update_count
+		,SUM(IOD.leaf_update_count_delta) AS leaf_update_count_delta
+		,SUM(IOD.leaf_ghost_count) AS leaf_ghost_count
+		,SUM(IOD.leaf_ghost_count_delta) AS leaf_ghost_count_delta
+		,SUM(IOD.nonleaf_insert_count) AS nonleaf_insert_count
+		,SUM(IOD.nonleaf_insert_count_delta) AS nonleaf_insert_count_delta
+		,SUM(IOD.nonleaf_delete_count) AS nonleaf_delete_count
+		,SUM(IOD.nonleaf_delete_count_delta) AS nonleaf_delete_count_delta
+		,SUM(IOD.nonleaf_update_count) AS nonleaf_update_count
+		,SUM(IOD.nonleaf_update_count_delta) AS nonleaf_update_count_delta
+		,SUM(IOD.leaf_allocation_count) AS leaf_allocation_count
+		,SUM(IOD.leaf_allocation_count_delta) AS leaf_allocation_count_delta
+		,SUM(IOD.nonleaf_allocation_count) AS nonleaf_allocation_count
+		,SUM(IOD.nonleaf_allocation_count_delta) AS nonleaf_allocation_count_delta
+		,SUM(IOD.leaf_page_merge_count) AS leaf_page_merge_count
+		,SUM(IOD.leaf_page_merge_count_delta) AS leaf_page_merge_count_delta
+		,SUM(IOD.nonleaf_page_merge_count) AS nonleaf_page_merge_count
+		,SUM(IOD.nonleaf_page_merge_count_delta) AS nonleaf_page_merge_count_delta
+		,SUM(IOD.range_scan_count) AS range_scan_count
+		,SUM(IOD.range_scan_count_delta) AS range_scan_count_delta
+		,SUM(IOD.singleton_lookup_count) AS singleton_lookup_count
+		,SUM(IOD.singleton_lookup_count_delta) AS singleton_lookup_count_delta
+		,SUM(IOD.forwarded_fetch_count) AS forwarded_fetch_count
+		,SUM(IOD.forwarded_fetch_count_delta) AS forwarded_fetch_count_delta
+		,SUM(IOD.lob_fetch_in_pages) AS lob_fetch_in_pages
+		,SUM(IOD.lob_fetch_in_pages_delta) AS lob_fetch_in_pages_delta
+		,SUM(IOD.lob_fetch_in_bytes) AS lob_fetch_in_bytes
+		,SUM(IOD.lob_fetch_in_bytes_delta) AS lob_fetch_in_bytes_delta
+		,SUM(IOD.lob_orphan_create_count) AS lob_orphan_create_count
+		,SUM(IOD.lob_orphan_create_count_delta) AS lob_orphan_create_count_delta
+		,SUM(IOD.lob_orphan_insert_count) AS lob_orphan_insert_count
+		,SUM(IOD.lob_orphan_insert_count_delta) AS lob_orphan_insert_count_delta
+		,SUM(IOD.row_overflow_fetch_in_pages) AS row_overflow_fetch_in_pages
+		,SUM(IOD.row_overflow_fetch_in_pages_delta) AS row_overflow_fetch_in_pages_delta
+		,SUM(IOD.row_overflow_fetch_in_bytes) AS row_overflow_fetch_in_bytes
+		,SUM(IOD.row_overflow_fetch_in_bytes_delta) AS row_overflow_fetch_in_bytes_delta
+		,SUM(IOD.column_value_push_off_row_count) AS column_value_push_off_row_count
+		,SUM(IOD.column_value_push_off_row_count_delta) AS column_value_push_off_row_count_delta
+		,SUM(IOD.column_value_pull_in_row_count) AS column_value_pull_in_row_count
+		,SUM(IOD.column_value_pull_in_row_count_delta) AS column_value_pull_in_row_count_delta
+		,SUM(IOD.row_lock_count) AS row_lock_count
+		,SUM(IOD.row_lock_count_delta) AS row_lock_count_delta
+		,SUM(IOD.row_lock_wait_count) AS row_lock_wait_count
+		,SUM(IOD.row_lock_wait_count_delta) AS row_lock_wait_count_delta
+		,SUM(IOD.row_lock_wait_in_ms) AS row_lock_wait_in_ms
+		,SUM(IOD.row_lock_wait_in_ms_delta) AS row_lock_wait_in_ms_delta
+		,SUM(IOD.page_lock_count) AS page_lock_count
+		,SUM(IOD.page_lock_count_delta) AS page_lock_count_delta
+		,SUM(IOD.page_lock_wait_count) AS page_lock_wait_count
+		,SUM(IOD.page_lock_wait_count_delta) AS page_lock_wait_count_delta
+		,SUM(IOD.page_lock_wait_in_ms) AS page_lock_wait_in_ms
+		,SUM(IOD.page_lock_wait_in_ms_delta) AS page_lock_wait_in_ms_delta
+		,SUM(IOD.index_lock_promotion_attempt_count) AS index_lock_promotion_attempt_count
+		,SUM(IOD.index_lock_promotion_attempt_count_delta) AS index_lock_promotion_attempt_count_delta
+		,SUM(IOD.index_lock_promotion_count) AS index_lock_promotion_count
+		,SUM(IOD.index_lock_promotion_count_delta) AS index_lock_promotion_count_delta
+		,SUM(IOD.page_latch_wait_count) AS page_latch_wait_count
+		,SUM(IOD.page_latch_wait_count_delta) AS page_latch_wait_count_delta
+		,SUM(IOD.page_latch_wait_in_ms) AS page_latch_wait_in_ms
+		,SUM(IOD.page_latch_wait_in_ms_delta) AS page_latch_wait_in_ms_delta
+		,SUM(IOD.page_io_latch_wait_count) AS page_io_latch_wait_count
+		,SUM(IOD.page_io_latch_wait_count_delta) AS page_io_latch_wait_count_delta
+		,SUM(IOD.page_io_latch_wait_in_ms) AS page_io_latch_wait_in_ms
+		,SUM(IOD.page_io_latch_wait_in_ms_delta) AS page_io_latch_wait_in_ms_delta
+		,SUM(IOD.tree_page_latch_wait_count) AS tree_page_latch_wait_count
+		,SUM(IOD.tree_page_latch_wait_count_delta) AS tree_page_latch_wait_count_delta
+		,SUM(IOD.tree_page_latch_wait_in_ms) AS tree_page_latch_wait_in_ms
+		,SUM(IOD.tree_page_latch_wait_in_ms_delta) AS tree_page_latch_wait_in_ms_delta
+		,SUM(IOD.tree_page_io_latch_wait_count) AS tree_page_io_latch_wait_count
+		,SUM(IOD.tree_page_io_latch_wait_count_delta) AS tree_page_io_latch_wait_count_delta
+		,SUM(IOD.tree_page_io_latch_wait_in_ms) AS tree_page_io_latch_wait_in_ms
+		,SUM(IOD.tree_page_io_latch_wait_in_ms_delta) AS tree_page_io_latch_wait_in_ms_delta
+		,SUM(IOD.page_compression_attempt_count) AS page_compression_attempt_count
+		,SUM(IOD.page_compression_attempt_count_delta) AS page_compression_attempt_count_delta
+		,SUM(IOD.page_compression_success_count) AS page_compression_success_count
+		,SUM(IOD.page_compression_success_count_delta) AS page_compression_success_count_delta
+	FROM
+		IndexOpDeltas IOD
+	GROUP BY
+		IOD.database_id
+		,IOD.[object_id]
+		,IOD.index_id
+)
+SELECT
+	DB_NAME(S.[database_id]) AS [database_name]
+	,S.[name] AS [schema_name]
+	,T.[name] AS [table_name]
+	,I.[name] AS [index_name]
+	,COALESCE(IUD.user_seeks, 0) AS user_seeks
+	,COALESCE(IUD.user_seeks_delta, 0) AS user_seeks_delta
+	,IUD.last_user_seek
+	,COALESCE(IUD.user_scans, 0) AS user_scans
+	,COALESCE(IUD.user_scans_delta, 0) AS user_scans_delta
+	,IUD.last_user_scan
+	,COALESCE(IUD.user_lookups, 0) AS user_lookups
+	,COALESCE(IUD.user_lookups_delta, 0) AS user_lookups_delta
+	,IUD.last_user_lookup
+	,COALESCE(IUD.user_updates, 0) AS user_updates
+	,COALESCE(IUD.user_updates_delta, 0) AS user_updates_delta
+	,IUD.last_user_update
+	,COALESCE(IUD.system_seeks, 0) AS system_seeks
+	,COALESCE(IUD.system_seeks_delta, 0) AS system_seeks_delta
+	,IUD.last_system_seek
+	,COALESCE(IUD.system_scans, 0) AS system_scans
+	,COALESCE(IUD.system_scans_delta, 0) AS system_scans_delta
+	,IUD.last_system_scan
+	,COALESCE(IUD.system_lookups, 0) AS system_lookups
+	,COALESCE(IUD.system_lookups_delta, 0) AS system_lookups_delta
+	,IUD.last_system_lookup
+	,COALESCE(IUD.system_updates, 0) AS system_updates
+	,COALESCE(IUD.system_updates_delta, 0) AS system_updates_delta
+	,IUD.last_system_update
+	,COALESCE(IOD.leaf_insert_count, 0) AS leaf_insert_count
+	,COALESCE(IOD.leaf_insert_count_delta, 0) AS leaf_insert_count_delta
+	,COALESCE(IOD.leaf_delete_count, 0) AS leaf_delete_count
+	,COALESCE(IOD.leaf_delete_count_delta, 0) AS leaf_delete_count_delta
+	,COALESCE(IOD.leaf_update_count, 0) AS leaf_update_count
+	,COALESCE(IOD.leaf_update_count_delta, 0) AS leaf_update_count_delta
+	,COALESCE(IOD.leaf_ghost_count, 0) AS leaf_ghost_count
+	,COALESCE(IOD.leaf_ghost_count_delta, 0) AS leaf_ghost_count_delta
+	,COALESCE(IOD.nonleaf_insert_count, 0) AS nonleaf_insert_count
+	,COALESCE(IOD.nonleaf_insert_count_delta, 0) AS nonleaf_insert_count_delta
+	,COALESCE(IOD.nonleaf_delete_count, 0) AS nonleaf_delete_count
+	,COALESCE(IOD.nonleaf_delete_count_delta, 0) AS nonleaf_delete_count_delta
+	,COALESCE(IOD.nonleaf_update_count, 0) AS nonleaf_update_count
+	,COALESCE(IOD.nonleaf_update_count_delta, 0) AS nonleaf_update_count_delta
+	,COALESCE(IOD.leaf_allocation_count, 0) AS leaf_allocation_count
+	,COALESCE(IOD.leaf_allocation_count_delta, 0) AS leaf_allocation_count_delta
+	,COALESCE(IOD.nonleaf_allocation_count, 0) AS nonleaf_allocation_count
+	,COALESCE(IOD.nonleaf_allocation_count_delta, 0) AS nonleaf_allocation_count_delta
+	,COALESCE(IOD.leaf_page_merge_count, 0) AS leaf_page_merge_count
+	,COALESCE(IOD.leaf_page_merge_count_delta, 0) AS leaf_page_merge_count_delta
+	,COALESCE(IOD.nonleaf_page_merge_count, 0) AS nonleaf_page_merge_count
+	,COALESCE(IOD.nonleaf_page_merge_count_delta, 0) AS nonleaf_page_merge_count_delta
+	,COALESCE(IOD.range_scan_count, 0) AS range_scan_count
+	,COALESCE(IOD.range_scan_count_delta, 0) AS range_scan_count_delta
+	,COALESCE(IOD.singleton_lookup_count, 0) AS singleton_lookup_count
+	,COALESCE(IOD.singleton_lookup_count_delta, 0) AS singleton_lookup_count_delta
+	,COALESCE(IOD.forwarded_fetch_count, 0) AS forwarded_fetch_count
+	,COALESCE(IOD.forwarded_fetch_count_delta, 0) AS forwarded_fetch_count_delta
+	,COALESCE(IOD.lob_fetch_in_pages, 0) AS lob_fetch_in_pages
+	,COALESCE(IOD.lob_fetch_in_pages_delta, 0) AS lob_fetch_in_pages_delta
+	,COALESCE(IOD.lob_fetch_in_bytes, 0) AS lob_fetch_in_bytes
+	,COALESCE(IOD.lob_fetch_in_bytes_delta, 0) AS lob_fetch_in_bytes_delta
+	,COALESCE(IOD.lob_orphan_create_count, 0) AS lob_orphan_create_count
+	,COALESCE(IOD.lob_orphan_create_count_delta, 0) AS lob_orphan_create_count_delta
+	,COALESCE(IOD.lob_orphan_insert_count, 0) AS lob_orphan_insert_count
+	,COALESCE(IOD.lob_orphan_insert_count_delta, 0) AS lob_orphan_insert_count_delta
+	,COALESCE(IOD.row_overflow_fetch_in_pages, 0) AS row_overflow_fetch_in_pages
+	,COALESCE(IOD.row_overflow_fetch_in_pages_delta, 0) AS row_overflow_fetch_in_pages_delta
+	,COALESCE(IOD.row_overflow_fetch_in_bytes, 0) AS row_overflow_fetch_in_bytes
+	,COALESCE(IOD.row_overflow_fetch_in_bytes_delta, 0) AS row_overflow_fetch_in_bytes_delta
+	,COALESCE(IOD.column_value_push_off_row_count, 0) AS column_value_push_off_row_count
+	,COALESCE(IOD.column_value_push_off_row_count_delta, 0) AS column_value_push_off_row_count_delta
+	,COALESCE(IOD.column_value_pull_in_row_count, 0) AS column_value_pull_in_row_count
+	,COALESCE(IOD.column_value_pull_in_row_count_delta, 0) AS column_value_pull_in_row_count_delta
+	,COALESCE(IOD.row_lock_count, 0) AS row_lock_count
+	,COALESCE(IOD.row_lock_count_delta, 0) AS row_lock_count_delta
+	,COALESCE(IOD.row_lock_wait_count, 0) AS row_lock_wait_count
+	,COALESCE(IOD.row_lock_wait_count_delta, 0) AS row_lock_wait_count_delta
+	,COALESCE(IOD.row_lock_wait_in_ms, 0) AS row_lock_wait_in_ms
+	,COALESCE(IOD.row_lock_wait_in_ms_delta, 0) AS row_lock_wait_in_ms_delta
+	,COALESCE(IOD.page_lock_count, 0) AS page_lock_count
+	,COALESCE(IOD.page_lock_count_delta, 0) AS page_lock_count_delta
+	,COALESCE(IOD.page_lock_wait_count, 0) AS page_lock_wait_count
+	,COALESCE(IOD.page_lock_wait_count_delta, 0) AS page_lock_wait_count_delta
+	,COALESCE(IOD.page_lock_wait_in_ms, 0) AS page_lock_wait_in_ms
+	,COALESCE(IOD.page_lock_wait_in_ms_delta, 0) AS page_lock_wait_in_ms_delta
+	,COALESCE(IOD.index_lock_promotion_attempt_count, 0) AS index_lock_promotion_attempt_count
+	,COALESCE(IOD.index_lock_promotion_attempt_count_delta, 0) AS index_lock_promotion_attempt_count_delta
+	,COALESCE(IOD.index_lock_promotion_count, 0) AS index_lock_promotion_count
+	,COALESCE(IOD.index_lock_promotion_count_delta, 0) AS index_lock_promotion_count_delta
+	,COALESCE(IOD.page_latch_wait_count, 0) AS page_latch_wait_count
+	,COALESCE(IOD.page_latch_wait_count_delta, 0) AS page_latch_wait_count_delta
+	,COALESCE(IOD.page_latch_wait_in_ms, 0) AS page_latch_wait_in_ms
+	,COALESCE(IOD.page_latch_wait_in_ms_delta, 0) AS page_latch_wait_in_ms_delta
+	,COALESCE(IOD.page_io_latch_wait_count, 0) AS page_io_latch_wait_count
+	,COALESCE(IOD.page_io_latch_wait_count_delta, 0) AS page_io_latch_wait_count_delta
+	,COALESCE(IOD.page_io_latch_wait_in_ms, 0) AS page_io_latch_wait_in_ms
+	,COALESCE(IOD.page_io_latch_wait_in_ms_delta, 0) AS page_io_latch_wait_in_ms_delta
+	,COALESCE(IOD.tree_page_latch_wait_count, 0) AS tree_page_latch_wait_count
+	,COALESCE(IOD.tree_page_latch_wait_count_delta, 0) AS tree_page_latch_wait_count_delta
+	,COALESCE(IOD.tree_page_latch_wait_in_ms, 0) AS tree_page_latch_wait_in_ms
+	,COALESCE(IOD.tree_page_latch_wait_in_ms_delta, 0) AS tree_page_latch_wait_in_ms_delta
+	,COALESCE(IOD.tree_page_io_latch_wait_count, 0) AS tree_page_io_latch_wait_count
+	,COALESCE(IOD.tree_page_io_latch_wait_count_delta, 0) AS tree_page_io_latch_wait_count_delta
+	,COALESCE(IOD.tree_page_io_latch_wait_in_ms, 0) AS tree_page_io_latch_wait_in_ms
+	,COALESCE(IOD.tree_page_io_latch_wait_in_ms_delta, 0) AS tree_page_io_latch_wait_in_ms_delta
+	,COALESCE(IOD.page_compression_attempt_count, 0) AS page_compression_attempt_count
+	,COALESCE(IOD.page_compression_attempt_count_delta, 0) AS page_compression_attempt_count_delta
+	,COALESCE(IOD.page_compression_success_count, 0) AS page_compression_success_count
+	,COALESCE(IOD.page_compression_success_count_delta, 0) AS page_compression_attempt_success_delta
+INTO
+	#IndexStatsFull
+FROM
+	--sys.schemas S
+	#AllSchemas S
+	--JOIN sys.tables T ON S.[schema_id] = T.[schema_id]
+	JOIN #AllTables T ON S.[database_id] = T.[database_id] AND S.[schema_id] = T.[schema_id]
+	--JOIN sys.indexes I ON T.[object_id] = I.[object_id]
+	JOIN #AllIndexes I ON T.[database_id] = I.[database_id] AND T.[object_id] = I.[object_id]
+	LEFT JOIN IndexUsageDeltas IUD ON I.[database_id] = IUD.[database_id] AND I.[object_id] = IUD.[object_id] AND I.[index_id] = IUD.[index_id]
+	LEFT JOIN IndexOpTotalDeltas IOD ON I.[database_id] = IOD.[database_id] AND I.[object_id] = IOD.[object_id] AND I.index_id = IOD.index_id;
+
+DROP TABLE #IndexUsagePreDelta;
+DROP TABLE #IndexOpPreDelta;
+DROP TABLE #IndexUsagePostDelta;
+DROP TABLE #IndexOpPostDelta;
+DROP TABLE #AllIndexes;
+DROP TABLE #AllTables;
+DROP TABLE #AllSchemas;
+
+SELECT
+	*
+FROM
+	#IndexStatsFull;
+
+--DROP TABLE #IndexStatsFull;
