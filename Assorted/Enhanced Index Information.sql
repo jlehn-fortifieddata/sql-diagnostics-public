@@ -1,5 +1,5 @@
 DECLARE @SchemaName sysname = N'dbo';  -- Sales, Sales, Sales
-DECLARE @ObjectName sysname = N'Enrollment_History';  -- Invoices, SpecialDeals_HEAP, Orders
+DECLARE @ObjectName sysname = N'PrincipalNames';  -- Invoices, SpecialDeals_HEAP, Orders
 
 -- Variables to hold lookup information for later.
 DECLARE @schema_id int;
@@ -385,7 +385,7 @@ SELECT
 	,NULL AS [is_enabled]
 	,NULL AS [is_for_replication]
 	,NULL AS [is_trusted]
-	,C.[name] + ':  ' + DC.[definition] AS [constraint_definition]
+	,C.[name] COLLATE DATABASE_DEFAULT + ':  '  COLLATE DATABASE_DEFAULT + DC.[definition] COLLATE DATABASE_DEFAULT AS [constraint_definition]
 	,NULL AS [key_columns]
 	,NULL AS [included_columns]
 	,NULL AS [referenced_schema_name]
@@ -409,7 +409,7 @@ SELECT
 	,CASE WHEN CC.[is_disabled] = 0 THEN 1 ELSE 0 END AS [is_enabled]
 	,CASE WHEN CC.[is_not_for_replication] = 1 THEN 0 ELSE 1 END AS [is_for_replication]
 	,CASE WHEN CC.[is_not_trusted] = 1 THEN 0 ELSE 1 END AS [is_trusted]
-	,C.[name] + ':  ' + CC.[definition] AS [constraint_definition]
+	,C.[name] COLLATE DATABASE_DEFAULT + ':  ' COLLATE DATABASE_DEFAULT + CC.[definition] COLLATE DATABASE_DEFAULT AS [constraint_definition]
 	,NULL AS [key_columns]
 	,NULL AS [included_columns]
 	,NULL AS [referenced_schema_name]
