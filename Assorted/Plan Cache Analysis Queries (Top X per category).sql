@@ -125,9 +125,9 @@ FilteredCacheSummary AS
 )
 SELECT
 	@@SERVERNAME AS server_name
-	,D.name AS database_name
-	,OBJECT_SCHEMA_NAME(ST.objectid, ST.[dbid]) AS [schema_name]
-	,OBJECT_NAME(ST.objectid, ST.[dbid]) AS [object_name]
+	,DB_NAME(CAST(D.[value] AS int)) AS [database_name]
+	,OBJECT_SCHEMA_NAME(CAST(O.[value] AS int), CAST(D.[value] AS int)) AS [schema_name]
+	,OBJECT_NAME(CAST(O.[value] AS int), CAST(D.[value] AS int)) AS [object_name]
 	,REPLACE(REPLACE(REPLACE(SUBSTRING(ST.[text], FCS.statement_start_offset / 2 + 1, (CASE WHEN FCS.statement_end_offset = -1 THEN LEN(CONVERT(NVARCHAR(MAX), ST.[text])) * 2 ELSE FCS.statement_end_offset END - FCS.statement_start_offset) / 2 + 1), CHAR(9), ' '), CHAR(10), ' '), CHAR(13), ' ') AS query_text
 	,FCS.creation_time
 	,FCS.last_execution_time
@@ -185,7 +185,25 @@ SELECT
 FROM
 	FilteredCacheSummary FCS
 	OUTER APPLY sys.dm_exec_sql_text(FCS.[sql_handle]) ST
-	LEFT JOIN sys.databases D ON ST.[dbid] = D.database_id
+	--LEFT JOIN sys.databases D ON ST.[dbid] = D.database_id
+	OUTER APPLY 
+	(
+		SELECT
+			EPA.[value]
+		FROM
+			[sys].[dm_exec_plan_attributes](FCS.[plan_handle]) EPA
+		WHERE
+			EPA.[attribute] = N'dbid'
+	) D
+	OUTER APPLY 
+	(
+		SELECT
+			EPA.[value]
+		FROM
+			[sys].[dm_exec_plan_attributes](FCS.[plan_handle]) EPA
+		WHERE
+			EPA.[attribute] = N'objectid'
+	) O
 	--OUTER APPLY sys.dm_exec_query_plan(FCS.[plan_handle]) EQP -- entire batch plan
 	OUTER APPLY sys.dm_exec_text_query_plan(FCS.[plan_handle], FCS.[statement_start_offset], FCS.[statement_end_offset]) EQP
 ORDER BY
