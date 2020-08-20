@@ -1,0 +1,253 @@
+SET NOCOUNT ON;
+
+-- CONFIGURATION VALUES
+-- NOTE THAT THE NEW SQL 2019 SPECIFIC OPTIONS ARE NOT INCLUDED YET
+DECLARE @ExecuteChanges bit = 1;  -- 1 = actually make config changes, 0 = print changes to be made only
+DECLARE @ConfigQSOverrideExistingValues bit = 1;  -- 0 = leave current values if query store is already enabled, 1 = change current values
+DECLARE @ConfigQSDesiredState smallint = 2;  -- 0 = OFF, 1 = READ_ONLY, 2 = READ_WRITE
+DECLARE @ConfigQSFlushIntervalSeconds bigint = 900;  -- 900 is the default (15 minutes)
+DECLARE @ConfigQSIntervalLengthMinutes bigint = 60;  -- can be 1, 5, 10, 15, 30, 60, or 1440 (60 is the default)
+DECLARE @ConfigQSMaxStorageSizeMB bigint = 512;  -- 100 is the default
+DECLARE @ConfigQSStaleQueryThresholdDays bigint = 367;  -- 30 is the default, 0 disables the retention policy
+DECLARE @ConfigQSMaxPlansPerQuery bigint = 200;  -- 200 is the default, 0 = unlimited
+DECLARE @ConfigQSQueryCaptureMode nvarchar(60) = N'AUTO';  -- ALL, AUTO, NONE (use AUTO unless you have a very good reason to capture all queries, performance will suffer)
+DECLARE @ConfigQSSizeBasedCleanupMode nvarchar(60) = N'AUTO';  -- OFF, AUTO (AUTO is the default)
+DECLARE @ConfigQSWaitStatsCaptureMode nvarchar(60) = N'ON';  -- ON, OFF (ON is the default)
+
+DECLARE @DatabaseName sysname;
+DECLARE @ExecuteSQL nvarchar(max);
+DECLARE @AlterCommandSQL nvarchar(max);
+
+DECLARE @QSIsQueryStoreOn bit;
+DECLARE @QSDesiredState smallint;
+DECLARE @QSDesiredStateDesc nvarchar(60);
+DECLARE @QSActualState smallint;
+DECLARE @QSActualStateDesc nvarchar(60);
+DECLARE @QSReadOnlyReason int;
+DECLARE @QSCurrentStorageSizeMB bigint;
+DECLARE @QSFlushIntervalSeconds bigint;
+DECLARE @QSIntervalLengthMinutes bigint;
+DECLARE @QSMaxStorageSizeMB bigint;
+DECLARE @QSStaleQueryThresholdDays bigint;
+DECLARE @QSMaxPlansPerQuery bigint;
+DECLARE @QSQueryCaptureMode smallint;
+DECLARE @QSQueryCaptureModeDesc nvarchar(60);
+DECLARE @QSSizeBasedCleanupMode smallint;
+DECLARE @QSSizeBasedCleanupModeDesc nvarchar(60);
+DECLARE @QSWaitStatsCaptureMode smallint;
+DECLARE @QSWaitStatsCaptureModeDesc nvarchar(60);
+
+IF (CAST(SERVERPROPERTY('ProductMajorVersion') AS float) >= 13)
+BEGIN
+	PRINT 'Query Store is supported on this SQL instance (' + @@SERVERNAME + ').';
+END
+ELSE
+BEGIN
+	PRINT 'Query Store is not supported on this SQL instance (' + @@SERVERNAME + ').';
+	GOTO EndExecution;
+END
+
+DECLARE DatabaseCursor CURSOR LOCAL FAST_FORWARD FOR
+SELECT
+	D.[name]
+FROM
+	[sys].[databases] D
+WHERE
+	D.[name] NOT IN (N'master', N'tempdb', N'distribution')
+	AND D.[state_desc] = 'ONLINE'
+ORDER BY
+	D.[name];
+
+OPEN DatabaseCursor;
+
+FETCH
+	DatabaseCursor
+INTO
+	@DatabaseName;
+
+WHILE (@@FETCH_STATUS = 0)
+BEGIN
+	-- If we're in an AG environment, check to see if this is the primary database.
+	IF (sys.fn_hadr_is_primary_replica(@DatabaseName) IS NULL OR sys.fn_hadr_is_primary_replica(@DatabaseName) = 1)
+	BEGIN
+		PRINT 'Checking query store settings for database ' + @DatabaseName + '...';
+	END
+	ELSE
+	BEGIN
+		PRINT 'Database ' + @DatabaseName + ' is not a local database or primary replica, skipping...';
+
+		GOTO SkipDatabase;
+	END
+
+
+	SET @ExecuteSQL = N'
+		SELECT
+			@QSIsQueryStoreOn = D.[is_query_store_on]
+			,@QSDesiredState = DQSO.[desired_state]
+			,@QSDesiredStateDesc = DQSO.[desired_state_desc]
+			,@QSActualState = DQSO.[actual_state]
+			,@QSActualStateDesc = DQSO.[actual_state_desc]
+			,@QSReadOnlyReason = DQSO.[readonly_reason]
+			,@QSCurrentStorageSizeMB = DQSO.[current_storage_size_mb]
+			,@QSFlushIntervalSeconds = DQSO.[flush_interval_seconds]
+			,@QSIntervalLengthMinutes = DQSO.[interval_length_minutes]
+			,@QSMaxStorageSizeMB = DQSO.[max_storage_size_mb]
+			,@QSStaleQueryThresholdDays = DQSO.[stale_query_threshold_days]
+			,@QSMaxPlansPerQuery = DQSO.[max_plans_per_query]
+			,@QSQueryCaptureMode = DQSO.[query_capture_mode]
+			,@QSQueryCaptureModeDesc = DQSO.[query_capture_mode_desc]
+			,@QSSizeBasedCleanupMode = DQSO.[size_based_cleanup_mode]
+			,@QSSizeBasedCleanupModeDesc = DQSO.[size_based_cleanup_mode_desc]
+		FROM
+			[sys].[databases] D
+			LEFT JOIN [###DATABASENAME###].[sys].[database_query_store_options] DQSO ON 1 = 1
+		WHERE
+			D.[name] = ''###DATABASENAME###''
+		OPTION (RECOMPILE);';
+
+	SET @ExecuteSQL = REPLACE(@ExecuteSQL, N'###DATABASENAME###', @DatabaseName);
+
+	--PRINT @ExecuteSQL;
+
+	EXEC sp_executesql @ExecuteSQL
+		,N'
+		@QSIsQueryStoreOn bit OUTPUT
+		,@QSDesiredState smallint OUTPUT
+		,@QSDesiredStateDesc nvarchar(60) OUTPUT
+		,@QSActualState smallint OUTPUT
+		,@QSActualStateDesc nvarchar(60) OUTPUT
+		,@QSReadOnlyReason int OUTPUT
+		,@QSCurrentStorageSizeMB bigint OUTPUT
+		,@QSFlushIntervalSeconds bigint OUTPUT
+		,@QSIntervalLengthMinutes bigint OUTPUT
+		,@QSMaxStorageSizeMB bigint OUTPUT
+		,@QSStaleQueryThresholdDays bigint OUTPUT
+		,@QSMaxPlansPerQuery bigint OUTPUT
+		,@QSQueryCaptureMode smallint OUTPUT
+		,@QSQueryCaptureModeDesc nvarchar(60) OUTPUT
+		,@QSSizeBasedCleanupMode smallint OUTPUT
+		,@QSSizeBasedCleanupModeDesc nvarchar(60) OUTPUT
+		'
+		,@QSIsQueryStoreOn OUTPUT
+		,@QSDesiredState OUTPUT
+		,@QSDesiredStateDesc OUTPUT
+		,@QSActualState OUTPUT
+		,@QSActualStateDesc OUTPUT
+		,@QSReadOnlyReason OUTPUT
+		,@QSCurrentStorageSizeMB OUTPUT
+		,@QSFlushIntervalSeconds OUTPUT
+		,@QSIntervalLengthMinutes OUTPUT
+		,@QSMaxStorageSizeMB OUTPUT
+		,@QSStaleQueryThresholdDays OUTPUT
+		,@QSMaxPlansPerQuery OUTPUT
+		,@QSQueryCaptureMode OUTPUT
+		,@QSQueryCaptureModeDesc OUTPUT
+		,@QSSizeBasedCleanupMode OUTPUT
+		,@QSSizeBasedCleanupModeDesc OUTPUT;
+
+	-- Wait stats weren't available until SQL 2017, have to run another query to check that.
+	IF (CAST(SERVERPROPERTY('ProductMajorVersion') AS float) >= 14)
+	BEGIN
+		SET @ExecuteSQL = N'
+			SELECT
+				@QSWaitStatsCaptureMode = DQSO.[wait_stats_capture_mode]
+				,@QSWaitStatsCaptureModeDesc = DQSO.[wait_stats_capture_mode_desc]
+			FROM
+				[sys].[databases] D
+				LEFT JOIN [###DATABASENAME###].[sys].[database_query_store_options] DQSO ON 1 = 1
+			WHERE
+				D.[name] = ''###DATABASENAME###''
+			OPTION (RECOMPILE);';
+
+		SET @ExecuteSQL = REPLACE(@ExecuteSQL, N'###DATABASENAME###', @DatabaseName);
+		
+		EXEC sp_executesql @ExecuteSQL
+			,N'
+			@QSWaitStatsCaptureMode smallint OUTPUT
+			,@QSWaitStatsCaptureModeDesc nvarchar(60) OUTPUT
+			'
+			,@QSWaitStatsCaptureMode OUTPUT
+			,@QSWaitStatsCaptureModeDesc OUTPUT;
+	END
+
+	IF (@QSIsQueryStoreOn IS NULL)
+	BEGIN
+		PRINT 'Uh oh';
+	END
+
+	PRINT 'Database name:  ' + @DatabaseName;
+	PRINT 'Query store enabled:  ' + CAST(@QSIsQueryStoreOn AS nvarchar);
+	PRINT 'Desired state:  ' + CAST(@QSDesiredState AS nvarchar) + ' (' + @QSDesiredStateDesc + ')';
+	PRINT 'Actual state:  ' + CAST(@QSActualState AS nvarchar) + ' (' + @QSActualStateDesc + ')';
+	PRINT 'Read only reason:  ' + CAST(@QSReadOnlyReason AS nvarchar);
+	PRINT 'Current storage size (MB):  ' + CAST(@QSCurrentStorageSizeMB AS nvarchar);
+	PRINT 'Flush interval (seconds):  ' + CAST(@QSFlushIntervalSeconds AS nvarchar);
+	PRINT 'Interval length (minutes):  ' + CAST(@QSIntervalLengthMinutes AS nvarchar);
+	PRINT 'Max storage size (MB):  ' + CAST(@QSMaxStorageSizeMB AS nvarchar);
+	PRINT 'Stale query threshold (days):  ' + CAST(@QSStaleQueryThresholdDays AS nvarchar);
+	PRINT 'Max plans per query:  ' + CAST(@QSMaxPlansPerQuery AS nvarchar);
+	PRINT 'Query capture mode:  ' + CAST(@QSQueryCaptureMode AS nvarchar) + ' (' + @QSQueryCaptureModeDesc + ')';
+	PRINT 'Size based cleanup mode:  ' + CAST(@QSSizeBasedCleanupMode AS nvarchar) + ' (' + @QSSizeBasedCleanupModeDesc + ')';
+
+	IF (CAST(SERVERPROPERTY('ProductMajorVersion') AS float) >= 14)
+	BEGIN
+		PRINT 'Wait stats capture mode:  ' + CAST(@QSWaitStatsCaptureMode AS nvarchar) + ' (' + @QSWaitStatsCaptureModeDesc + ')';
+	END	
+
+
+	IF (@ConfigQSDesiredState = 2 AND @ConfigQSOverrideExistingValues = 1)
+	BEGIN
+		SET @AlterCommandSQL = N'ALTER DATABASE [' + @DatabaseName + N'] SET QUERY_STORE = ON (OPERATION_MODE = READ_WRITE, ';
+		SET @AlterCommandSQL = @AlterCommandSQL + N'CLEANUP_POLICY = (STALE_QUERY_THRESHOLD_DAYS = ' + CAST(@ConfigQSStaleQueryThresholdDays AS nvarchar) + N'), ';
+		SET @AlterCommandSQL = @AlterCommandSQL + N'DATA_FLUSH_INTERVAL_SECONDS = ' + CAST(@ConfigQSFlushIntervalSeconds AS nvarchar) + N', ';
+		SET @AlterCommandSQL = @AlterCommandSQL + N'MAX_STORAGE_SIZE_MB = ' + CAST(@ConfigQSMaxStorageSizeMB AS nvarchar) + N', ';
+		SET @AlterCommandSQL = @AlterCommandSQL + N'INTERVAL_LENGTH_MINUTES = ' + CAST(@ConfigQSIntervalLengthMinutes AS nvarchar) + N', ';
+		SET @AlterCommandSQL = @AlterCommandSQL + N'SIZE_BASED_CLEANUP_MODE = ' + @ConfigQSSizeBasedCleanupMode + N', ';
+		SET @AlterCommandSQL = @AlterCommandSQL + N'QUERY_CAPTURE_MODE = ' + @ConfigQSQueryCaptureMode + N', ';
+		SET @AlterCommandSQL = @AlterCommandSQL + N'MAX_PLANS_PER_QUERY = ' + CAST(@ConfigQSMaxPlansPerQuery AS nvarchar);
+
+		IF (CAST(SERVERPROPERTY('ProductMajorVersion') AS float) >= 14)
+		BEGIN
+			SET @AlterCommandSQL = @AlterCommandSQL + N', ' + N'WAIT_STATS_CAPTURE_MODE = ' + CAST(@ConfigQSWaitStatsCaptureMode AS nvarchar);
+		END
+
+		SET @AlterCommandSQL = @AlterCommandSQL + N');'
+	END
+	ELSE IF (@ConfigQSDesiredState = 2 AND @ConfigQSOverrideExistingValues = 0)
+	BEGIN
+		SET @AlterCommandSQL = N'ALTER DATABASE [' + @DatabaseName + N'] SET QUERY_STORE = ON (OPERATION_MODE = READ_WRITE);';
+	END
+	ELSE IF (@ConfigQSDesiredState = 1)
+	BEGIN
+		SET @AlterCommandSQL = N'ALTER DATABASE [' + @DatabaseName + N'] SET QUERY_STORE = ON (OPERATION_MODE = READ_ONLY);';
+	END
+	ELSE IF (@ConfigQSDesiredState = 0)
+	BEGIN
+		SET @AlterCommandSQL = N'ALTER DATABASE [' + @DatabaseName + N'] SET QUERY_STORE = OFF;';
+	END
+
+	PRINT @AlterCommandSQL;
+
+	IF (@ExecuteChanges = 1)
+	BEGIN
+		PRINT 'Executing alter command due to script config settings.';
+
+		EXEC sp_executesql @AlterCommandSQL;
+	END
+	ELSE
+	BEGIN
+		PRINT 'Not executing alter command due to script config settings.';
+	END
+
+	SkipDatabase:
+	FETCH
+		DatabaseCursor
+	INTO
+		@DatabaseName;
+END
+
+CLOSE DatabaseCursor;
+DEALLOCATE DatabaseCursor;
+
+EndExecution:
+PRINT 'Query Store configuration script complete.';
