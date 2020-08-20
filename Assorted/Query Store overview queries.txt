@@ -1,0 +1,1713 @@
+-- SQL 2017+ Query Store Analysis
+USE [master];
+
+SET NOCOUNT ON;
+
+/*
+Parameters
+
+NOTE THAT @SchemaName, @ObjectName, @QueryText, AND @AnalysisMode ARE NOT IMPLEMENTED YET.
+
+1.  @TimeZone:  The time zone you want to work in for date ranges and display and whatnot.
+                If you want a list of valid time zone names for this parameter, use this query:
+                SELECT * FROM [sys].[time_zone_info];
+
+2.  @StartTime:  The starting point for analysis (will be in the time zone you specify).
+
+3.  @EndTime:  The ending point for analysis (will be in the time zone you specify).
+
+4.  @DatabaseList:  NULL for all databases, or a comma delimited list of specified databases to analyze.
+
+5.  @SchemaName:  NULL for all data, or specify a schema name if you want to filter down to a specific schema/object.
+
+6.  @ObjectName:  NULL for all data, or specify an object name if you want to filter down to a specific object.
+
+7.  @QueryText:  NULL for all data, or specify some query text to search for (this can potentially perform horribly, so limit it as much as possible).
+
+8.  @GetQueryPlanXML:  0 for no, 1 for yes.  Setting this to 1 may make things take a long time if you're pulling a lot of results.
+
+9.  @AnalysisMode:  1 = aggregated stats with rankings (database/query/plan/plan execution type levels).
+*/
+
+-- PARAMETER VALUES, CAN BE MODIFIED
+DECLARE @TimeZone sysname = N'Eastern Standard Time';
+DECLARE @StartTime datetime = '20200701 00:00';
+DECLARE @EndTime datetime = '20200801 00:00';
+DECLARE @DatabaseList nvarchar(4000) = NULL;  -- N'I3AIUSA,I3Heifer';
+DECLARE @SchemaName nvarchar(1000) = NULL; -- N'dbo'
+DECLARE @ObjectName nvarchar(1000) = NULL; --N'JoinSourceFromSourceCodeId';
+DECLARE @QueryText nvarchar(1000) = NULL; --N'%DimGLCode%';
+DECLARE @GetQueryPlanXML bit = 0;
+DECLARE @AnalysisMode tinyint = 1;
+
+-- LOCAL VARIABLES, DO NOT TOUCH THESE
+DECLARE @StartTimeUTC datetimeoffset = CAST(@StartTime AS datetime) AT TIME ZONE @TimeZone;
+DECLARE @EndTimeUTC datetimeoffset = CAST(@EndTime AS datetime) AT TIME ZONE @TimeZone;
+DECLARE @DatabaseCount int = 0;
+DECLARE @CurrentDatabaseId int;
+DECLARE @CurrentDatabaseName sysname;
+DECLARE @ExecuteSQL nvarchar(max);
+DECLARE @RowCount bigint;
+
+/*
+SELECT
+	@TimeZone
+	,@StartTime
+	,@EndTime
+	,@StartTimeUTC
+	,@EndTimeUTC
+	,@DatabaseList;
+*/
+
+-- Get the list of databases that we will be working with.
+CREATE TABLE
+	#DatabaseList
+	(
+		[database_id] int NOT NULL
+		,[name] sysname NOT NULL
+	)
+
+ALTER TABLE
+	[#DatabaseList]
+ADD CONSTRAINT
+	[PK_#DatabaseList]
+PRIMARY KEY CLUSTERED
+	(
+		[database_id]
+	);
+
+ALTER TABLE
+	[#DatabaseList]
+ADD CONSTRAINT
+	[UX_#DatabaseList_name]
+UNIQUE
+	(
+		[name]
+	);
+
+-- Check to see if Query Store is available (SQL 2016+).
+BEGIN TRY
+IF (CAST(SERVERPROPERTY('ProductMajorVersion') AS int) < 13)
+BEGIN
+	PRINT 'Query Store is not available in this version of SQL Server.';
+	
+	GOTO EndExecution;
+END
+END TRY
+BEGIN CATCH
+	PRINT 'Unable to determine SQL Server version.';
+
+	GOTO EndExecution;
+END CATCH
+
+BEGIN TRY
+	IF (@DatabaseList IS NULL)
+	BEGIN
+		-- We will check all databases that have query store enabled.
+		INSERT INTO
+			#DatabaseList
+			(
+				[database_id]
+				,[name]
+			)
+		SELECT
+			D.[database_id]
+			,D.[name]
+		FROM
+			[sys].[databases] D
+		WHERE
+			D.[is_query_store_on] = 1
+		ORDER BY
+			D.[database_id];
+	END
+	ELSE
+	BEGIN
+		-- We will only check the specified databases.
+		INSERT INTO
+			#DatabaseList
+			(
+				[database_id]
+				,[name]
+			)
+		SELECT
+			DB_ID(X.[name])
+			,X.[name]
+		FROM
+			(
+				SELECT
+					D.[database_id]
+					,D.[name]
+				FROM
+					[sys].[databases] D
+					JOIN STRING_SPLIT(@DatabaseList, N',') S ON D.[name] = S.[value]
+				WHERE
+					D.[is_query_store_on] = 1
+			) X
+		ORDER BY
+			X.[database_id];
+	END
+END TRY
+BEGIN CATCH
+	PRINT 'ERROR:  Error creating database list, ending execution.';
+
+	GOTO EndExecution;
+END CATCH
+
+-- Check to make sure we actually have databases to work with.
+SELECT
+	@DatabaseCount = COUNT(1)
+FROM
+	#DatabaseList;
+
+IF (@DatabaseCount < 1)
+BEGIN
+	PRINT 'ERROR:  No databases were found to analyze, ending execution.';
+
+	GOTO EndExecution;
+END
+
+-- Create tables to hold statistics and whatnot.
+-- This table will hold data from sys.query_store_runtime_stats (this needs to be aggregated to be useful).
+CREATE TABLE
+	#QueryStoreRuntimeStats
+	(
+		[database_id] int
+		,[runtime_stats_id] bigint
+		,[plan_id] bigint
+		,[start_time] datetimeoffset
+		,[end_time] datetimeoffset
+		,[execution_type] tinyint
+		,[execution_type_desc] nvarchar(128)
+		,[first_execution_time] datetimeoffset
+		,[last_execution_time] datetimeoffset
+		,[count_executions] bigint
+		,[avg_duration] float
+		,[last_duration] bigint
+		,[min_duration] bigint
+		,[max_duration] bigint
+		,[avg_cpu_time] float
+		,[last_cpu_time] bigint
+		,[min_cpu_time] bigint
+		,[max_cpu_time] bigint
+		,[avg_logical_io_reads] float
+		,[last_logical_io_reads] bigint
+		,[min_logical_io_reads] bigint
+		,[max_logical_io_reads] bigint
+		,[avg_logical_io_writes] float
+		,[last_logical_io_writes] bigint
+		,[min_logical_io_writes] bigint
+		,[max_logical_io_writes] bigint
+		,[avg_physical_io_reads] float
+		,[last_physical_io_reads] bigint
+		,[min_physical_io_reads] bigint
+		,[max_physical_io_reads] bigint
+		,[avg_clr_time] float
+		,[last_clr_time] bigint
+		,[min_clr_time] bigint
+		,[max_clr_time] bigint
+		,[avg_dop] float
+		,[last_dop] bigint
+		,[min_dop] bigint
+		,[max_dop] bigint
+		,[avg_query_max_used_memory] float
+		,[last_query_max_used_memory] bigint
+		,[min_query_max_used_memory] bigint
+		,[max_query_max_used_memory] bigint
+		,[avg_rowcount] float
+		,[last_rowcount] bigint
+		,[min_rowcount] bigint
+		,[max_rowcount] bigint
+		--,[avg_log_bytes_used] float
+		--,[last_log_bytes_used] bigint
+		--,[min_log_bytes_used] bigint
+		--,[max_log_bytes_used] bigint
+		--,[avg_tempdb_space_used] float
+		--,[last_tempdb_space_used] bigint
+		--,[min_tempdb_space_used] bigint
+		--,[max_tempdb_space_used] bigint
+	);
+
+CREATE CLUSTERED INDEX
+	[CX_#QueryStoreRuntimeStats]
+ON
+	[#QueryStoreRuntimeStats]
+	(
+		[database_id]
+		,[plan_id]
+	)
+WITH (DATA_COMPRESSION = PAGE);
+
+-- This table will hold data from sys.query_store_plan.
+CREATE TABLE
+	#QueryStorePlan
+	(
+		[database_id] int NOT NULL
+		,[plan_id] bigint NOT NULL
+		,[query_id] bigint
+		,[plan_group_id] bigint
+		,[engine_version] nvarchar(32)
+		,[compatibility_level] smallint
+		,[query_plan_hash] binary(8)
+		,[query_plan] nvarchar(max)
+		,[is_online_index_plan] bit
+		,[is_trivial_plan] bit
+		,[is_parallel_plan] bit
+		,[is_forced_plan] bit
+		,[is_natively_compiled] bit
+		,[force_failure_count] bigint
+		,[last_force_failure_reason] int
+		,[last_force_failure_reason_desc] nvarchar(128)
+		,[count_compiles] bigint
+		,[initial_compile_start_time] datetimeoffset
+		,[last_compile_start_time] datetimeoffset
+		,[last_execution_time] datetimeoffset
+		,[avg_compile_duration] float
+		,[last_compile_duration] bigint
+		--,[plan_forcing_type] int
+		--,[plan_forcing_type_desc] nvarchar(60)
+	);
+
+ALTER TABLE
+	[#QueryStorePlan]
+ADD CONSTRAINT
+	[PK_#QueryStorePlan]
+PRIMARY KEY CLUSTERED
+	(
+		[database_id]
+		,[plan_id]
+	)
+WITH (DATA_COMPRESSION = PAGE);
+
+-- This table will hold data from sys.query_store_query.
+CREATE TABLE
+	#QueryStoreQuery
+	(
+		[database_id] int NOT NULL
+		,[query_id] bigint NOT NULL
+		,[query_text_id] bigint
+		,[context_settings_id] bigint
+		,[object_id] bigint
+		,[schema_name] sysname NULL
+		,[object_name] sysname NULL
+		,[batch_sql_handle] varbinary(64)
+		,[query_hash] binary(8)
+		,[is_internal_query] bit
+		,[query_parameterization_type] tinyint
+		,[query_parameterization_type_desc] nvarchar(60)
+		,[initial_compile_start_time] datetimeoffset
+		,[last_compile_start_time] datetimeoffset
+		,[last_execution_time] datetimeoffset
+		,[last_compile_batch_sql_handle] varbinary(64)
+		,[last_compile_batch_offset_start] bigint
+		,[last_compile_batch_offset_end] bigint
+		,[count_compiles] bigint
+		,[avg_compile_duration] float
+		,[last_compile_duration] bigint
+		,[avg_bind_duration] float
+		,[last_bind_duration] bigint
+		,[avg_bind_cpu_time] float
+		,[last_bind_cpu_time] bigint
+		,[avg_optimize_duration] float
+		,[last_optimize_duration] bigint
+		,[avg_optimize_cpu_time] float
+		,[last_optimize_cpu_time] bigint
+		,[avg_compile_memory_kb] float
+		,[last_compile_memory_kb] bigint
+		,[max_compile_memory_kb] bigint
+		,[is_clouddb_internal_query] bit
+	);
+
+ALTER TABLE
+	[#QueryStoreQuery]
+ADD CONSTRAINT
+	[PK_#QueryStoreQuery]
+PRIMARY KEY CLUSTERED
+	(
+		[database_id]
+		,[query_id]
+	)
+WITH (DATA_COMPRESSION = PAGE);
+
+-- This table will hold data from sys.query_store_query_text.
+CREATE TABLE
+	#QueryStoreQueryText
+	(
+		[database_id] int NOT NULL
+		,[query_text_id] bigint NOT NULL
+		,[query_sql_text] nvarchar(max)
+		,[statement_sql_handle] varbinary(64)
+		,[is_part_of_encrypted_module] bit
+		,[has_restricted_text] bit
+	);
+
+ALTER TABLE
+	[#QueryStoreQueryText]
+ADD CONSTRAINT
+	[PK_#QueryStoreQueryText]
+PRIMARY KEY CLUSTERED
+	(
+		[database_id]
+		,[query_text_id]
+	)
+WITH (DATA_COMPRESSION = PAGE);
+
+-- This table will hold data from sys.query_store_context_settings.
+CREATE TABLE
+	#QueryContextSettings
+	(
+		[database_id] int NOT NULL
+		,[context_settings_id] bigint NOT NULL
+		,[set_options] varbinary(8)
+		,[language_id] smallint
+		,[date_format] smallint
+		,[date_first] tinyint
+		,[status] varbinary(2)
+		,[required_cursor_options] int
+		,[acceptable_cursor_options] int
+		,[merge_action_type] smallint
+		,[default_schema_id] int
+		,[is_replication_specific] bit
+		,[is_contained] varbinary(1)
+	);
+
+ALTER TABLE
+	[#QueryContextSettings]
+ADD CONSTRAINT
+	[PK_#QueryContextSettings]
+PRIMARY KEY CLUSTERED
+	(
+		[database_id]
+		,[context_settings_id]
+	)
+WITH (DATA_COMPRESSION = PAGE);
+
+
+
+-- Loop through the databases and gather statistics.
+DECLARE DatabaseCursor CURSOR LOCAL FAST_FORWARD FOR
+SELECT
+	DL.[database_id]
+	,DL.[name]
+FROM
+	#DatabaseList DL
+ORDER BY
+	DL.[database_id];
+
+OPEN DatabaseCursor;
+
+FETCH
+	DatabaseCursor
+INTO
+	@CurrentDatabaseId
+	,@CurrentDatabaseName;
+
+WHILE (@@FETCH_STATUS = 0)
+BEGIN
+	BEGIN TRY
+		-- Build the dynamic SQL statement to populate #QueryStoreRuntimeStats.
+		SET @ExecuteSQL = N'
+			INSERT INTO
+				#QueryStoreRuntimeStats
+			SELECT
+				###DATABASE_ID### AS [database_id]
+				,QSRS.[runtime_stats_id]
+				,QSRS.[plan_id]
+				,QSRSI.[start_time]
+				,QSRSI.[end_time]
+				,QSRS.[execution_type]
+				,QSRS.[execution_type_desc]
+				,QSRS.[first_execution_time]
+				,QSRS.[last_execution_time]
+				,QSRS.[count_executions]
+				,QSRS.[avg_duration]
+				,QSRS.[last_duration]
+				,QSRS.[min_duration]
+				,QSRS.[max_duration]
+				,QSRS.[avg_cpu_time]
+				,QSRS.[last_cpu_time]
+				,QSRS.[min_cpu_time]
+				,QSRS.[max_cpu_time]
+				,QSRS.[avg_logical_io_reads]
+				,QSRS.[last_logical_io_reads]
+				,QSRS.[min_logical_io_reads]
+				,QSRS.[max_logical_io_reads]
+				,QSRS.[avg_logical_io_writes]
+				,QSRS.[last_logical_io_writes]
+				,QSRS.[min_logical_io_writes]
+				,QSRS.[max_logical_io_writes]
+				,QSRS.[avg_physical_io_reads]
+				,QSRS.[last_physical_io_reads]
+				,QSRS.[min_physical_io_reads]
+				,QSRS.[max_physical_io_reads]
+				,QSRS.[avg_clr_time]
+				,QSRS.[last_clr_time]
+				,QSRS.[min_clr_time]
+				,QSRS.[max_clr_time]
+				,QSRS.[avg_dop]
+				,QSRS.[last_dop]
+				,QSRS.[min_dop]
+				,QSRS.[max_dop]
+				,QSRS.[avg_query_max_used_memory]
+				,QSRS.[last_query_max_used_memory]
+				,QSRS.[min_query_max_used_memory]
+				,QSRS.[max_query_max_used_memory]
+				,QSRS.[avg_rowcount]
+				,QSRS.[last_rowcount]
+				,QSRS.[min_rowcount]
+				,QSRS.[max_rowcount]
+				--,QSRS.[avg_log_bytes_used]
+				--,QSRS.[last_log_bytes_used]
+				--,QSRS.[min_log_bytes_used]
+				--,QSRS.[max_log_bytes_used]
+				--,QSRS.[avg_tempdb_space_used]
+				--,QSRS.[last_tempdb_space_used]
+				--,QSRS.[min_tempdb_space_used]
+				--,QSRS.[max_tempdb_space_used]
+			FROM
+				[###DATABASE_NAME###].[sys].[query_store_runtime_stats] QSRS
+				JOIN [###DATABASE_NAME###].[sys].[query_store_runtime_stats_interval] QSRSI ON QSRS.[runtime_stats_interval_id] = QSRSI.[runtime_stats_interval_id]
+				--JOIN [###DATABASE_NAME###].[sys].[query_store_plan] QSP ON QSRS.[plan_id] = QSP.[plan_id]
+				--JOIN [###DATABASE_NAME###].[sys].[query_store_query] QSQ ON QSP.[query_id] = QSQ.[query_id]
+				--JOIN [###DATABASE_NAME###].[sys].[query_store_query_text] QSQT ON QSQ.[query_text_id] = QSQT.[query_text_id]
+			WHERE
+				QSRSI.[start_time] < @EndTimeUTC
+				AND QSRSI.[end_time] >= @StartTimeUTC';
+
+			-- We can't do any filtering here yet, we have to grab all of the information during the specified time period
+			-- in order to properly rank the results.
+			/*
+			IF (@ObjectName IS NOT NULL)
+			BEGIN
+				SET @ExecuteSQL = @ExecuteSQL + N'
+					AND QSQ.[object_id] = OBJECT_ID(N''[' + @CurrentDatabaseName + N'].' + @ObjectName + ''')';
+			END
+
+			IF (@QueryText IS NOT NULL)
+			BEGIN
+				SET @ExecuteSQL = @ExecuteSQL + N'
+					AND QSQT.[query_sql_text] LIKE ''' + @QueryText + N'''';
+			END
+			*/
+
+			SET @ExecuteSQL = @ExecuteSQL + N'
+				OPTION (RECOMPILE);';
+
+		-- Replace placeholders in dynamic query with proper values.
+		SET @ExecuteSQL = REPLACE(@ExecuteSQL, N'###DATABASE_ID###', CAST(@CurrentDatabaseId AS nvarchar(40)));
+		SET @ExecuteSQL = REPLACE(@ExecuteSQL, N'###DATABASE_NAME###', @CurrentDatabaseName);
+
+		--PRINT @ExecuteSQL;
+
+		EXEC sp_executesql
+			@ExecuteSQL
+			,N'@EndTimeUTC datetimeoffset, @StartTimeUTC datetimeoffset'
+			,@EndTimeUTC
+			,@StartTimeUTC;
+
+		SET @RowCount = @@ROWCOUNT;
+
+		PRINT 'Inserted ' + CAST(@RowCount AS nvarchar(40)) + ' rows into #QueryStoreRuntimeStats from database ' + @CurrentDatabaseName + '.';
+
+		-- Build the dynamic SQL statement to populate #QueryStorePlan.
+		SET @ExecuteSQL = N'
+			INSERT INTO
+				#QueryStorePlan
+			SELECT
+				###DATABASE_ID### AS [database_id]
+				,QSP.[plan_id]
+				,QSP.[query_id]
+				,QSP.[plan_group_id]
+				,QSP.[engine_version]
+				,QSP.[compatibility_level]
+				,QSP.[query_plan_hash]
+				,QSP.[query_plan]
+				,QSP.[is_online_index_plan]
+				,QSP.[is_trivial_plan]
+				,QSP.[is_parallel_plan]
+				,QSP.[is_forced_plan]
+				,QSP.[is_natively_compiled]
+				,QSP.[force_failure_count]
+				,QSP.[last_force_failure_reason]
+				,QSP.[last_force_failure_reason_desc]
+				,QSP.[count_compiles]
+				,QSP.[initial_compile_start_time]
+				,QSP.[last_compile_start_time]
+				,QSP.[last_execution_time]
+				,QSP.[avg_compile_duration]
+				,QSP.[last_compile_duration]
+				--,QSP.[plan_forcing_type]
+				--,QSP.[plan_forcing_type_desc]
+			FROM
+				[###DATABASE_NAME###].[sys].[query_store_plan] QSP
+			WHERE
+				QSP.[plan_id] IN
+				(
+					SELECT DISTINCT
+						RQRS.[plan_id]
+					FROM
+						#QueryStoreRuntimeStats RQRS
+					WHERE
+						RQRS.[database_id] = @DatabaseId
+				)
+			OPTION (RECOMPILE);';
+
+		-- Replace placeholders in dynamic query with proper values.
+		SET @ExecuteSQL = REPLACE(@ExecuteSQL, N'###DATABASE_ID###', CAST(@CurrentDatabaseId AS nvarchar(40)));
+		SET @ExecuteSQL = REPLACE(@ExecuteSQL, N'###DATABASE_NAME###', @CurrentDatabaseName);
+
+		--PRINT @ExecuteSQL;
+
+		EXEC sp_executesql
+			@ExecuteSQL
+			,N'@DatabaseId int'
+			,@CurrentDatabaseId;
+
+		SET @RowCount = @@ROWCOUNT;
+
+		PRINT 'Inserted ' + CAST(@RowCount AS nvarchar(40)) + ' rows into #QueryStorePlan from database ' + @CurrentDatabaseName + '.';
+
+		-- Build the dynamic SQL statement to populate #QueryStoreQuery.
+		SET @ExecuteSQL = N'
+			INSERT INTO
+				#QueryStoreQuery
+			SELECT
+				###DATABASE_ID### AS [database_id]
+				,QSQ.[query_id]
+				,QSQ.[query_text_id]
+				,QSQ.[context_settings_id]
+				,QSQ.[object_id]
+				,OBJECT_SCHEMA_NAME(QSQ.[object_id], @DatabaseId) AS [schema_name]
+				,OBJECT_NAME(QSQ.[object_id], @DatabaseId) AS [object_name]
+				,QSQ.[batch_sql_handle]
+				,QSQ.[query_hash]
+				,QSQ.[is_internal_query]
+				,QSQ.[query_parameterization_type]
+				,QSQ.[query_parameterization_type_desc]
+				,QSQ.[initial_compile_start_time]
+				,QSQ.[last_compile_start_time]
+				,QSQ.[last_execution_time]
+				,QSQ.[last_compile_batch_sql_handle]
+				,QSQ.[last_compile_batch_offset_start]
+				,QSQ.[last_compile_batch_offset_end]
+				,QSQ.[count_compiles]
+				,QSQ.[avg_compile_duration]
+				,QSQ.[last_compile_duration]
+				,QSQ.[avg_bind_duration]
+				,QSQ.[last_bind_duration]
+				,QSQ.[avg_bind_cpu_time]
+				,QSQ.[last_bind_cpu_time]
+				,QSQ.[avg_optimize_duration]
+				,QSQ.[last_optimize_duration]
+				,QSQ.[avg_optimize_cpu_time]
+				,QSQ.[last_optimize_cpu_time]
+				,QSQ.[avg_compile_memory_kb]
+				,QSQ.[last_compile_memory_kb]
+				,QSQ.[max_compile_memory_kb]
+				,QSQ.[is_clouddb_internal_query]
+			FROM
+				[###DATABASE_NAME###].[sys].[query_store_query] QSQ
+			WHERE
+				QSQ.[query_id] IN
+				(
+					SELECT DISTINCT
+						QSP.[query_id]
+					FROM
+						#QueryStorePlan QSP
+					WHERE
+						QSP.[database_id] = @DatabaseId
+				)
+			OPTION (RECOMPILE);';
+
+		-- Replace placeholders in dynamic query with proper values.
+		SET @ExecuteSQL = REPLACE(@ExecuteSQL, N'###DATABASE_ID###', CAST(@CurrentDatabaseId AS nvarchar(40)));
+		SET @ExecuteSQL = REPLACE(@ExecuteSQL, N'###DATABASE_NAME###', @CurrentDatabaseName);
+
+		--PRINT @ExecuteSQL;
+
+		EXEC sp_executesql
+			@ExecuteSQL
+			,N'@DatabaseId int'
+			,@CurrentDatabaseId;
+
+		SET @RowCount = @@ROWCOUNT;
+
+		PRINT 'Inserted ' + CAST(@RowCount AS nvarchar(40)) + ' rows into #QueryStoreQuery from database ' + @CurrentDatabaseName + '.';
+
+		-- Build the dynamic SQL statement to populate #QueryStoreQueryText.
+		SET @ExecuteSQL = N'
+			INSERT INTO
+				#QueryStoreQueryText
+			SELECT
+				###DATABASE_ID### AS [database_id]
+				,QSQT.[query_text_id]
+				,QSQT.[query_sql_text]
+				,QSQT.[statement_sql_handle]
+				,QSQT.[is_part_of_encrypted_module]
+				,QSQT.[has_restricted_text]
+			FROM
+				[###DATABASE_NAME###].[sys].[query_store_query_text] QSQT
+			WHERE
+				QSQT.[query_text_id] IN
+				(
+					SELECT DISTINCT
+						QSQ.[query_text_id]
+					FROM
+						#QueryStoreQuery QSQ
+					WHERE
+						QSQ.[database_id] = @DatabaseId
+				)
+			OPTION (RECOMPILE);';
+
+		-- Replace placeholders in dynamic query with proper values.
+		SET @ExecuteSQL = REPLACE(@ExecuteSQL, N'###DATABASE_ID###', CAST(@CurrentDatabaseId AS nvarchar(40)));
+		SET @ExecuteSQL = REPLACE(@ExecuteSQL, N'###DATABASE_NAME###', @CurrentDatabaseName);
+
+		--PRINT @ExecuteSQL;
+
+		EXEC sp_executesql
+			@ExecuteSQL
+			,N'@DatabaseId int'
+			,@CurrentDatabaseId;
+
+		SET @RowCount = @@ROWCOUNT;
+
+		PRINT 'Inserted ' + CAST(@RowCount AS nvarchar(40)) + ' rows into #QueryStoreQueryText from database ' + @CurrentDatabaseName + '.';
+
+		-- Build the dynamic SQL statement to populate #QueryContextSettings.
+		SET @ExecuteSQL = N'
+			INSERT INTO
+				#QueryContextSettings
+			SELECT
+				###DATABASE_ID### AS [database_id]
+				,QCS.[context_settings_id]
+				,QCS.[set_options]
+				,QCS.[language_id]
+				,QCS.[date_format]
+				,QCS.[date_first]
+				,QCS.[status]
+				,QCS.[required_cursor_options]
+				,QCS.[acceptable_cursor_options]
+				,QCS.[merge_action_type]
+				,QCS.[default_schema_id]
+				,QCS.[is_replication_specific]
+				,QCS.[is_contained]
+			FROM
+				[###DATABASE_NAME###].[sys].[query_context_settings] QCS
+			WHERE
+				QCS.[context_settings_id] IN
+				(
+					SELECT DISTINCT
+						QSQ.[context_settings_id]
+					FROM
+						#QueryStoreQuery QSQ
+					WHERE
+						QSQ.[database_id] = @DatabaseId
+				)
+			OPTION (RECOMPILE);';
+
+		-- Replace placeholders in dynamic query with proper values.
+		SET @ExecuteSQL = REPLACE(@ExecuteSQL, N'###DATABASE_ID###', CAST(@CurrentDatabaseId AS nvarchar(40)));
+		SET @ExecuteSQL = REPLACE(@ExecuteSQL, N'###DATABASE_NAME###', @CurrentDatabaseName);
+
+		--PRINT @ExecuteSQL;
+
+		EXEC sp_executesql
+			@ExecuteSQL
+			,N'@DatabaseId int'
+			,@CurrentDatabaseId;
+
+		SET @RowCount = @@ROWCOUNT;
+
+		PRINT 'Inserted ' + CAST(@RowCount AS nvarchar(40)) + ' rows into #QueryContextSettings from database ' + @CurrentDatabaseName + '.';
+
+	END TRY
+	BEGIN CATCH
+		PRINT 'ERROR ' + CAST(ERROR_NUMBER() AS varchar(20)) + ':  ' + ERROR_MESSAGE();
+		PRINT 'ERROR:  unable to gather raw query store information for ' + @CurrentDatabaseName + '.';
+	END CATCH
+
+	-- Move to the next database.
+	FETCH
+		DatabaseCursor
+	INTO
+		@CurrentDatabaseId
+		,@CurrentDatabaseName;
+END
+
+CLOSE DatabaseCursor;
+DEALLOCATE DatabaseCursor;
+
+
+-- Test stuff
+/*
+SELECT
+	*
+FROM
+	#QueryStoreRuntimeStats RQRS
+ORDER BY
+	RQRS.[database_id]
+	,RQRS.[plan_id]
+	,RQRS.[start_time];
+
+SELECT
+	*
+FROM
+	#QueryStorePlan QSP
+ORDER BY
+	QSP.[database_id]
+	,QSP.[plan_id];
+
+SELECT
+	*
+FROM
+	#QueryStoreQuery QSQ
+ORDER BY
+	QSQ.[database_id]
+	,QSQ.[query_id];
+
+SELECT
+	*
+FROM
+	#QueryStoreQueryText QSQT
+ORDER BY
+	QSQT.[database_id]
+	,QSQT.[query_text_id];
+
+SELECT
+	*
+FROM
+	#QueryContextSettings QCS
+ORDER BY
+	QCS.[database_id]
+	,QCS.[context_settings_id];
+
+
+IF (@AnalysisMode = 1)
+BEGIN
+	-- Summary by query.
+	SELECT 1;
+END
+ELSE IF (@AnalysisMode = 2)
+BEGIN
+	-- Summary by plan.
+	SELECT 1;
+
+END
+*/
+
+-- All relevant data has been gathered, time to start aggregating.
+-- Gather aggregations by database/query/plan/execution type.
+SELECT
+	QSRS.[database_id]
+	,QSP.[query_id]
+	,QSRS.[plan_id]
+	,QSRS.[execution_type]
+	,QSRS.[execution_type_desc]
+	,MIN(QSRS.[first_execution_time]) AS [first_execution_time]
+	,MAX(QSRS.[last_execution_time]) AS [last_execution_time]
+	,SUM(QSRS.[count_executions]) AS [count_executions]
+	,SUM(QSRS.[avg_duration] * QSRS.[count_executions]) AS [total_duration]
+	,AVG(QSRS.[avg_duration]) AS [avg_duration]
+	,MIN(QSRS.[min_duration]) AS [min_duration]
+	,MAX(QSRS.[max_duration]) AS [max_duration]
+	,SUM(QSRS.[avg_cpu_time] * QSRS.[count_executions]) AS [total_cpu_time]
+	,AVG(QSRS.[avg_cpu_time]) AS [avg_cpu_time]
+	,MIN(QSRS.[min_cpu_time]) AS [min_cpu_time]
+	,MAX(QSRS.[max_cpu_time]) AS [max_cpu_time]
+	,SUM(QSRS.[avg_logical_io_reads] * QSRS.[count_executions]) AS [total_logical_io_reads]
+	,AVG(QSRS.[avg_logical_io_reads]) AS [avg_logical_io_reads]
+	,MIN(QSRS.[min_logical_io_reads]) AS [min_logical_io_reads]
+	,MAX(QSRS.[max_logical_io_reads]) AS [max_logical_io_reads]
+	,SUM(QSRS.[avg_logical_io_writes] * QSRS.[count_executions]) AS [total_logical_io_writes]
+	,AVG(QSRS.[avg_logical_io_writes]) AS [avg_logical_io_writes]
+	,MIN(QSRS.[min_logical_io_writes]) AS [min_logical_io_writes]
+	,MAX(QSRS.[max_logical_io_writes]) AS [max_logical_io_writes]
+	,sum(QSRS.[avg_physical_io_reads] * QSRS.[count_executions]) AS [total_physical_io_reads]
+	,AVG(QSRS.[avg_physical_io_reads]) AS [avg_physical_io_reads]
+	,MIN(QSRS.[min_physical_io_reads]) AS [min_physical_io_reads]
+	,MAX(QSRS.[max_physical_io_reads]) AS [max_physical_io_reads]
+	,SUM(QSRS.[avg_clr_time] * QSRS.[count_executions]) AS [total_clr_time]
+	,AVG(QSRS.[avg_clr_time]) AS [avg_clr_time]
+	,MIN(QSRS.[min_clr_time]) AS [min_clr_time]
+	,MAX(QSRS.[max_clr_time]) AS [max_clr_time]
+	,AVG(QSRS.[avg_dop]) AS [avg_dop]
+	,MIN(QSRS.[min_dop]) AS [min_dop]
+	,MAX(QSRS.[max_dop]) AS [max_dop]
+	,AVG(QSRS.[avg_query_max_used_memory]) AS [avg_query_max_used_memory]
+	,MIN(QSRS.[min_query_max_used_memory]) AS [min_query_max_used_memory]
+	,MAX(QSRS.[max_query_max_used_memory]) AS [max_query_max_used_memory]
+	,SUM(QSRS.[avg_rowcount] * QSRS.[count_executions]) AS [total_rowcount]
+	,AVG(QSRS.[avg_rowcount]) AS [avg_rowcount]
+	,MIN(QSRS.[min_rowcount]) AS [min_rowcount]
+	,MAX(QSRS.[max_rowcount]) AS [max_rowcount]
+	--,SUM(QSRS.[avg_log_bytes_used] * QSRS.[count_executions]) AS [total_log_bytes_used]
+	--,AVG(QSRS.[avg_log_bytes_used]) AS [avg_log_bytes_used]
+	--,MIN(QSRS.[min_log_bytes_used]) AS [min_log_bytes_used]
+	--,MAX(QSRS.[max_log_bytes_used]) AS [max_log_bytes_used]
+	--,SUM(QSRS.[avg_tempdb_space_used] * QSRS.[count_executions]) AS [total_tempdb_space_used]
+	--,AVG(QSRS.[avg_tempdb_space_used]) AS [avg_tempdb_space_used]
+	--,MIN(QSRS.[min_tempdb_space_used]) AS [min_tempdb_space_used]
+	--,MAX(QSRS.[max_tempdb_space_used]) AS [max_tempdb_space_used]
+INTO
+	#QueryStoreRuntimeStatsAggregatedLevel4
+FROM
+	#QueryStoreRuntimeStats QSRS
+	JOIN #QueryStorePlan QSP ON QSRS.[database_id] = QSP.[database_id] AND QSRS.[plan_id] = QSP.[plan_id]
+GROUP BY
+	QSRS.[database_id]
+	,QSP.[query_id]
+	,QSRS.[plan_id]
+	,QSRS.[execution_type]
+	,QSRS.[execution_type_desc]
+ORDER BY
+	QSRS.[database_id]
+	,QSP.[query_id]
+	,QSRS.[plan_id]
+	,QSRS.[execution_type]
+	,QSRS.[execution_type_desc]
+OPTION (RECOMPILE);
+
+/*
+SELECT
+	QSRSAL4.*
+FROM
+	#QueryStoreRuntimeStatsAggregatedLevel4 QSRSAL4
+ORDER BY
+	QSRSAL4.[database_id]
+	,QSRSAL4.[query_id]
+	,QSRSAL4.[plan_id]
+	,QSRSAL4.[execution_type]
+	,QSRSAL4.[execution_type_desc];
+*/
+
+-- Rank aggregations by database/query/plan/execution type.
+SELECT
+	QSRSAL4.[database_id]
+	,QSRSAL4.[query_id]
+	,QSRSAL4.[plan_id]
+	,QSRSAL4.[execution_type]
+	,QSRSAL4.[execution_type_desc]
+	,QSRSAL4.[first_execution_time]
+	,QSRSAL4.[last_execution_time]
+	,QSRSAL4.[count_executions]
+	,CASE WHEN SUM(QSRSAL4.[count_executions]) OVER () > 0 THEN CAST(QSRSAL4.[count_executions] AS float) / CAST(SUM(QSRSAL4.[count_executions]) OVER () AS float) ELSE 0 END AS [count_executions_percent]
+	,RANK() OVER (ORDER BY QSRSAL4.[count_executions] DESC) AS [count_executions_rank]
+	,QSRSAL4.[total_duration]
+	,QSRSAL4.[avg_duration]
+	,QSRSAL4.[min_duration]
+	,QSRSAL4.[max_duration]
+	,CASE WHEN SUM(QSRSAL4.[total_duration]) OVER () > 0 THEN CAST(QSRSAL4.[total_duration] AS float) / CAST(SUM(QSRSAL4.[total_duration]) OVER () AS float) ELSE 0 END AS [total_duration_percent]
+	,RANK() OVER (ORDER BY QSRSAL4.[total_duration] DESC) AS [total_duration_rank]
+	,QSRSAL4.[total_cpu_time]
+	,QSRSAL4.[avg_cpu_time]
+	,QSRSAL4.[min_cpu_time]
+	,QSRSAL4.[max_cpu_time]
+	,CASE WHEN SUM(QSRSAL4.[total_cpu_time]) OVER () > 0 THEN CAST(QSRSAL4.[total_cpu_time] AS float) / CAST(SUM(QSRSAL4.[total_cpu_time]) OVER () AS float) ELSE 0 END AS [total_cpu_time_percent]
+	,RANK() OVER (ORDER BY QSRSAL4.[total_cpu_time] DESC) AS [total_cpu_time_rank]
+	,QSRSAL4.[total_logical_io_reads]
+	,QSRSAL4.[avg_logical_io_reads]
+	,QSRSAL4.[min_logical_io_reads]
+	,QSRSAL4.[max_logical_io_reads]
+	,CASE WHEN SUM(QSRSAL4.[total_logical_io_reads]) OVER () > 0 THEN CAST(QSRSAL4.[total_logical_io_reads] AS float) / CAST(SUM(QSRSAL4.[total_logical_io_reads]) OVER () AS float) ELSE 0 END AS [total_logical_io_reads_percent]
+	,RANK() OVER (ORDER BY QSRSAL4.[total_logical_io_reads] DESC) AS [total_logical_io_reads_rank]
+	,QSRSAL4.[total_logical_io_writes]
+	,QSRSAL4.[avg_logical_io_writes]
+	,QSRSAL4.[min_logical_io_writes]
+	,QSRSAL4.[max_logical_io_writes]
+	,CASE WHEN SUM(QSRSAL4.[total_logical_io_writes]) OVER () > 0 THEN CAST(QSRSAL4.[total_logical_io_writes] AS float) / CAST(SUM(QSRSAL4.[total_logical_io_writes]) OVER () AS float) ELSE 0 END AS [total_logical_io_writes_percent]
+	,RANK() OVER (ORDER BY QSRSAL4.[total_logical_io_writes] DESC) AS [total_logical_io_writes_rank]
+	,QSRSAL4.[total_physical_io_reads]
+	,QSRSAL4.[avg_physical_io_reads]
+	,QSRSAL4.[min_physical_io_reads]
+	,QSRSAL4.[max_physical_io_reads]
+	,CASE WHEN SUM(QSRSAL4.[total_physical_io_reads]) OVER () > 0 THEN CAST(QSRSAL4.[total_physical_io_reads] AS float) / CAST(SUM(QSRSAL4.[total_physical_io_reads]) OVER () AS float) ELSE 0 END AS [total_physical_io_reads_percent]
+	,RANK() OVER (ORDER BY QSRSAL4.[total_physical_io_reads] DESC) AS [total_physical_io_reads_rank]
+	,QSRSAL4.[total_clr_time]
+	,QSRSAL4.[avg_clr_time]
+	,QSRSAL4.[min_clr_time]
+	,QSRSAL4.[max_clr_time]
+	,CASE WHEN SUM(QSRSAL4.[total_clr_time]) OVER () > 0 THEN CAST(QSRSAL4.[total_clr_time] AS float) / CAST(SUM(QSRSAL4.[total_clr_time]) OVER () AS float) ELSE 0 END AS [total_clr_time_percent]
+	,RANK() OVER (ORDER BY QSRSAL4.[total_clr_time] DESC) AS [total_clr_time_rank]
+	,QSRSAL4.[avg_dop]
+	,QSRSAL4.[min_dop]
+	,QSRSAL4.[max_dop]
+	,QSRSAL4.[avg_query_max_used_memory]
+	,QSRSAL4.[min_query_max_used_memory]
+	,QSRSAL4.[max_query_max_used_memory]
+	,QSRSAL4.[total_rowcount]
+	,QSRSAL4.[avg_rowcount]
+	,QSRSAL4.[min_rowcount]
+	,QSRSAL4.[max_rowcount]
+	,CASE WHEN SUM(QSRSAL4.[total_rowcount]) OVER () > 0 THEN CAST(QSRSAL4.[total_rowcount] AS float) / CAST(SUM(QSRSAL4.[total_rowcount]) OVER () AS float) ELSE 0 END AS [total_rowcount_percent]
+	,RANK() OVER (ORDER BY QSRSAL4.[total_rowcount] DESC) AS [total_rowcount_rank]
+	--,QSRSAL4.[total_log_bytes_used]
+	--,QSRSAL4.[avg_log_bytes_used]
+	--,QSRSAL4.[min_log_bytes_used]
+	--,QSRSAL4.[max_log_bytes_used]
+	--,CASE WHEN SUM(QSRSAL4.[total_log_bytes_used]) OVER () > 0 THEN CAST(QSRSAL4.[total_log_bytes_used] AS float) / CAST(SUM(QSRSAL4.[total_log_bytes_used]) OVER () AS float) ELSE 0 END AS [total_log_bytes_used_percent]
+	--,RANK() OVER (ORDER BY QSRSAL4.[total_log_bytes_used] DESC) AS [total_log_bytes_used_rank]
+	--,QSRSAL4.[total_tempdb_space_used]
+	--,QSRSAL4.[avg_tempdb_space_used]
+	--,QSRSAL4.[min_tempdb_space_used]
+	--,QSRSAL4.[max_tempdb_space_used]
+	--,CASE WHEN SUM(QSRSAL4.[total_tempdb_space_used]) OVER () > 0 THEN CAST(QSRSAL4.[total_tempdb_space_used] AS float) / CAST(SUM(QSRSAL4.[total_tempdb_space_used]) OVER () AS float) ELSE 0 END AS [total_tempdb_space_used_percent]
+	--,RANK() OVER (ORDER BY QSRSAL4.[total_tempdb_space_used] DESC) AS [total_tempdb_space_used_rank]
+INTO
+	#QueryStoreRuntimeStatsAggregatedRankedLevel4
+FROM
+	#QueryStoreRuntimeStatsAggregatedLevel4 QSRSAL4
+OPTION (RECOMPILE);
+
+/*
+SELECT
+	*
+FROM
+	#QueryStoreRuntimeStatsAggregatedRankedLevel4 X
+ORDER BY
+	X.[total_tempdb_space_used_rank];
+*/
+
+-- Gather aggregations by database/query/plan.
+SELECT
+	QSRSAL4.[database_id]
+	,QSRSAL4.[query_id]
+	,QSRSAL4.[plan_id]
+	,MIN(QSRSAL4.[first_execution_time]) AS [first_execution_time]
+	,MAX(QSRSAL4.[last_execution_time]) AS [last_execution_time]
+	,SUM(QSRSAL4.[count_executions]) AS [count_executions]
+	,SUM(QSRSAL4.[total_duration]) AS [total_duration]
+	,AVG(QSRSAL4.[avg_duration]) AS [avg_duration]
+	,MIN(QSRSAL4.[min_duration]) AS [min_duration]
+	,MAX(QSRSAL4.[max_duration]) AS [max_duration]
+	,SUM(QSRSAL4.[total_cpu_time]) AS [total_cpu_time]
+	,AVG(QSRSAL4.[avg_cpu_time]) AS [avg_cpu_time]
+	,MIN(QSRSAL4.[min_cpu_time]) AS [min_cpu_time]
+	,MAX(QSRSAL4.[max_cpu_time]) AS [max_cpu_time]
+	,SUM(QSRSAL4.[total_logical_io_reads]) AS [total_logical_io_reads]
+	,AVG(QSRSAL4.[avg_logical_io_reads]) AS [avg_logical_io_reads]
+	,MIN(QSRSAL4.[min_logical_io_reads]) AS [min_logical_io_reads]
+	,MAX(QSRSAL4.[max_logical_io_reads]) AS [max_logical_io_reads]
+	,SUM(QSRSAL4.[total_logical_io_writes]) AS [total_logical_io_writes]
+	,AVG(QSRSAL4.[avg_logical_io_writes]) AS [avg_logical_io_writes]
+	,MIN(QSRSAL4.[min_logical_io_writes]) AS [min_logical_io_writes]
+	,MAX(QSRSAL4.[max_logical_io_writes]) AS [max_logical_io_writes]
+	,sum(QSRSAL4.[total_physical_io_reads]) AS [total_physical_io_reads]
+	,AVG(QSRSAL4.[avg_physical_io_reads]) AS [avg_physical_io_reads]
+	,MIN(QSRSAL4.[min_physical_io_reads]) AS [min_physical_io_reads]
+	,MAX(QSRSAL4.[max_physical_io_reads]) AS [max_physical_io_reads]
+	,SUM(QSRSAL4.[total_clr_time]) AS [total_clr_time]
+	,AVG(QSRSAL4.[avg_clr_time]) AS [avg_clr_time]
+	,MIN(QSRSAL4.[min_clr_time]) AS [min_clr_time]
+	,MAX(QSRSAL4.[max_clr_time]) AS [max_clr_time]
+	,AVG(QSRSAL4.[avg_dop]) AS [avg_dop]
+	,MIN(QSRSAL4.[min_dop]) AS [min_dop]
+	,MAX(QSRSAL4.[max_dop]) AS [max_dop]
+	,AVG(QSRSAL4.[avg_query_max_used_memory]) AS [avg_query_max_used_memory]
+	,MIN(QSRSAL4.[min_query_max_used_memory]) AS [min_query_max_used_memory]
+	,MAX(QSRSAL4.[max_query_max_used_memory]) AS [max_query_max_used_memory]
+	,SUM(QSRSAL4.[total_rowcount]) AS [total_rowcount]
+	,AVG(QSRSAL4.[avg_rowcount]) AS [avg_rowcount]
+	,MIN(QSRSAL4.[min_rowcount]) AS [min_rowcount]
+	,MAX(QSRSAL4.[max_rowcount]) AS [max_rowcount]
+	--,SUM(QSRSAL4.[total_log_bytes_used]) AS [total_log_bytes_used]
+	--,AVG(QSRSAL4.[avg_log_bytes_used]) AS [avg_log_bytes_used]
+	--,MIN(QSRSAL4.[min_log_bytes_used]) AS [min_log_bytes_used]
+	--,MAX(QSRSAL4.[max_log_bytes_used]) AS [max_log_bytes_used]
+	--,SUM(QSRSAL4.[total_tempdb_space_used]) AS [total_tempdb_space_used]
+	--,AVG(QSRSAL4.[avg_tempdb_space_used]) AS [avg_tempdb_space_used]
+	--,MIN(QSRSAL4.[min_tempdb_space_used]) AS [min_tempdb_space_used]
+	--,MAX(QSRSAL4.[max_tempdb_space_used]) AS [max_tempdb_space_used]
+INTO
+	#QueryStoreRuntimeStatsAggregatedLevel3
+FROM
+	#QueryStoreRuntimeStatsAggregatedLevel4 QSRSAL4
+GROUP BY
+	QSRSAL4.[database_id]
+	,QSRSAL4.[query_id]
+	,QSRSAL4.[plan_id]
+ORDER BY
+	QSRSAL4.[database_id]
+	,QSRSAL4.[query_id]
+	,QSRSAL4.[plan_id]
+OPTION (RECOMPILE);
+
+/*
+SELECT
+	QSRSAL3.*
+FROM
+	#QueryStoreRuntimeStatsAggregatedLevel3 QSRSAL3
+ORDER BY
+	QSRSAL3.[database_id]
+	,QSRSAL3.[query_id]
+	,QSRSAL3.[plan_id];
+*/
+
+-- Rank aggregations by database/query/plan.
+SELECT
+	QSRSAL3.[database_id]
+	,QSRSAL3.[query_id]
+	,QSRSAL3.[plan_id]
+	,QSRSAL3.[first_execution_time]
+	,QSRSAL3.[last_execution_time]
+	,QSRSAL3.[count_executions]
+	,CASE WHEN SUM(QSRSAL3.[count_executions]) OVER () > 0 THEN CAST(QSRSAL3.[count_executions] AS float) / CAST(SUM(QSRSAL3.[count_executions]) OVER () AS float) ELSE 0 END AS [count_executions_percent]
+	,RANK() OVER (ORDER BY QSRSAL3.[count_executions] DESC) AS [count_executions_rank]
+	,QSRSAL3.[total_duration]
+	,QSRSAL3.[avg_duration]
+	,QSRSAL3.[min_duration]
+	,QSRSAL3.[max_duration]
+	,CASE WHEN SUM(QSRSAL3.[total_duration]) OVER () > 0 THEN CAST(QSRSAL3.[total_duration] AS float) / CAST(SUM(QSRSAL3.[total_duration]) OVER () AS float) ELSE 0 END AS [total_duration_percent]
+	,RANK() OVER (ORDER BY QSRSAL3.[total_duration] DESC) AS [total_duration_rank]
+	,QSRSAL3.[total_cpu_time]
+	,QSRSAL3.[avg_cpu_time]
+	,QSRSAL3.[min_cpu_time]
+	,QSRSAL3.[max_cpu_time]
+	,CASE WHEN SUM(QSRSAL3.[total_cpu_time]) OVER () > 0 THEN CAST(QSRSAL3.[total_cpu_time] AS float) / CAST(SUM(QSRSAL3.[total_cpu_time]) OVER () AS float) ELSE 0 END AS [total_cpu_time_percent]
+	,RANK() OVER (ORDER BY QSRSAL3.[total_cpu_time] DESC) AS [total_cpu_time_rank]
+	,QSRSAL3.[total_logical_io_reads]
+	,QSRSAL3.[avg_logical_io_reads]
+	,QSRSAL3.[min_logical_io_reads]
+	,QSRSAL3.[max_logical_io_reads]
+	,CASE WHEN SUM(QSRSAL3.[total_logical_io_reads]) OVER () > 0 THEN CAST(QSRSAL3.[total_logical_io_reads] AS float) / CAST(SUM(QSRSAL3.[total_logical_io_reads]) OVER () AS float) ELSE 0 END AS [total_logical_io_reads_percent]
+	,RANK() OVER (ORDER BY QSRSAL3.[total_logical_io_reads] DESC) AS [total_logical_io_reads_rank]
+	,QSRSAL3.[total_logical_io_writes]
+	,QSRSAL3.[avg_logical_io_writes]
+	,QSRSAL3.[min_logical_io_writes]
+	,QSRSAL3.[max_logical_io_writes]
+	,CASE WHEN SUM(QSRSAL3.[total_logical_io_writes]) OVER () > 0 THEN CAST(QSRSAL3.[total_logical_io_writes] AS float) / CAST(SUM(QSRSAL3.[total_logical_io_writes]) OVER () AS float) ELSE 0 END AS [total_logical_io_writes_percent]
+	,RANK() OVER (ORDER BY QSRSAL3.[total_logical_io_writes] DESC) AS [total_logical_io_writes_rank]
+	,QSRSAL3.[total_physical_io_reads]
+	,QSRSAL3.[avg_physical_io_reads]
+	,QSRSAL3.[min_physical_io_reads]
+	,QSRSAL3.[max_physical_io_reads]
+	,CASE WHEN SUM(QSRSAL3.[total_physical_io_reads]) OVER () > 0 THEN CAST(QSRSAL3.[total_physical_io_reads] AS float) / CAST(SUM(QSRSAL3.[total_physical_io_reads]) OVER () AS float) ELSE 0 END AS [total_physical_io_reads_percent]
+	,RANK() OVER (ORDER BY QSRSAL3.[total_physical_io_reads] DESC) AS [total_physical_io_reads_rank]
+	,QSRSAL3.[total_clr_time]
+	,QSRSAL3.[avg_clr_time]
+	,QSRSAL3.[min_clr_time]
+	,QSRSAL3.[max_clr_time]
+	,CASE WHEN SUM(QSRSAL3.[total_clr_time]) OVER () > 0 THEN CAST(QSRSAL3.[total_clr_time] AS float) / CAST(SUM(QSRSAL3.[total_clr_time]) OVER () AS float) ELSE 0 END AS [total_clr_time_percent]
+	,RANK() OVER (ORDER BY QSRSAL3.[total_clr_time] DESC) AS [total_clr_time_rank]
+	,QSRSAL3.[avg_dop]
+	,QSRSAL3.[min_dop]
+	,QSRSAL3.[max_dop]
+	,QSRSAL3.[avg_query_max_used_memory]
+	,QSRSAL3.[min_query_max_used_memory]
+	,QSRSAL3.[max_query_max_used_memory]
+	,QSRSAL3.[total_rowcount]
+	,QSRSAL3.[avg_rowcount]
+	,QSRSAL3.[min_rowcount]
+	,QSRSAL3.[max_rowcount]
+	,CASE WHEN SUM(QSRSAL3.[total_rowcount]) OVER () > 0 THEN CAST(QSRSAL3.[total_rowcount] AS float) / CAST(SUM(QSRSAL3.[total_rowcount]) OVER () AS float) ELSE 0 END AS [total_rowcount_percent]
+	,RANK() OVER (ORDER BY QSRSAL3.[total_rowcount] DESC) AS [total_rowcount_rank]
+	--,QSRSAL3.[total_log_bytes_used]
+	--,QSRSAL3.[avg_log_bytes_used]
+	--,QSRSAL3.[min_log_bytes_used]
+	--,QSRSAL3.[max_log_bytes_used]
+	--,CASE WHEN SUM(QSRSAL3.[total_log_bytes_used]) OVER () > 0 THEN CAST(QSRSAL3.[total_log_bytes_used] AS float) / CAST(SUM(QSRSAL3.[total_log_bytes_used]) OVER () AS float) ELSE 0 END AS [total_log_bytes_used_percent]
+	--,RANK() OVER (ORDER BY QSRSAL3.[total_log_bytes_used] DESC) AS [total_log_bytes_used_rank]
+	--,QSRSAL3.[total_tempdb_space_used]
+	--,QSRSAL3.[avg_tempdb_space_used]
+	--,QSRSAL3.[min_tempdb_space_used]
+	--,QSRSAL3.[max_tempdb_space_used]
+	--,CASE WHEN SUM(QSRSAL3.[total_tempdb_space_used]) OVER () > 0 THEN CAST(QSRSAL3.[total_tempdb_space_used] AS float) / CAST(SUM(QSRSAL3.[total_tempdb_space_used]) OVER () AS float) ELSE 0 END AS [total_tempdb_space_used_percent]
+	--,RANK() OVER (ORDER BY QSRSAL3.[total_tempdb_space_used] DESC) AS [total_tempdb_space_used_rank]
+INTO
+	#QueryStoreRuntimeStatsAggregatedRankedLevel3
+FROM
+	#QueryStoreRuntimeStatsAggregatedLevel3 QSRSAL3
+ORDER BY
+	QSRSAL3.[database_id]
+	,QSRSAL3.[query_id]
+	,QSRSAL3.[plan_id]
+OPTION (RECOMPILE);
+
+/*
+SELECT
+	QSRSARL3.*
+FROM
+	#QueryStoreRuntimeStatsAggregatedRankedLevel3 QSRSARL3
+ORDER BY
+	QSRSARL3.[database_id]
+	,QSRSARL3.[query_id]
+	,QSRSARL3.[plan_id];
+*/
+
+-- Gather aggregations by database/query.
+SELECT
+	QSRSAL3.[database_id]
+	,QSRSAL3.[query_id]
+	,MIN(QSRSAL3.[first_execution_time]) AS [first_execution_time]
+	,MAX(QSRSAL3.[last_execution_time]) AS [last_execution_time]
+	,SUM(QSRSAL3.[count_executions]) AS [count_executions]
+	,SUM(QSRSAL3.[total_duration]) AS [total_duration]
+	,AVG(QSRSAL3.[avg_duration]) AS [avg_duration]
+	,MIN(QSRSAL3.[min_duration]) AS [min_duration]
+	,MAX(QSRSAL3.[max_duration]) AS [max_duration]
+	,SUM(QSRSAL3.[total_cpu_time]) AS [total_cpu_time]
+	,AVG(QSRSAL3.[avg_cpu_time]) AS [avg_cpu_time]
+	,MIN(QSRSAL3.[min_cpu_time]) AS [min_cpu_time]
+	,MAX(QSRSAL3.[max_cpu_time]) AS [max_cpu_time]
+	,SUM(QSRSAL3.[total_logical_io_reads]) AS [total_logical_io_reads]
+	,AVG(QSRSAL3.[avg_logical_io_reads]) AS [avg_logical_io_reads]
+	,MIN(QSRSAL3.[min_logical_io_reads]) AS [min_logical_io_reads]
+	,MAX(QSRSAL3.[max_logical_io_reads]) AS [max_logical_io_reads]
+	,SUM(QSRSAL3.[total_logical_io_writes]) AS [total_logical_io_writes]
+	,AVG(QSRSAL3.[avg_logical_io_writes]) AS [avg_logical_io_writes]
+	,MIN(QSRSAL3.[min_logical_io_writes]) AS [min_logical_io_writes]
+	,MAX(QSRSAL3.[max_logical_io_writes]) AS [max_logical_io_writes]
+	,sum(QSRSAL3.[total_physical_io_reads]) AS [total_physical_io_reads]
+	,AVG(QSRSAL3.[avg_physical_io_reads]) AS [avg_physical_io_reads]
+	,MIN(QSRSAL3.[min_physical_io_reads]) AS [min_physical_io_reads]
+	,MAX(QSRSAL3.[max_physical_io_reads]) AS [max_physical_io_reads]
+	,SUM(QSRSAL3.[total_clr_time]) AS [total_clr_time]
+	,AVG(QSRSAL3.[avg_clr_time]) AS [avg_clr_time]
+	,MIN(QSRSAL3.[min_clr_time]) AS [min_clr_time]
+	,MAX(QSRSAL3.[max_clr_time]) AS [max_clr_time]
+	,AVG(QSRSAL3.[avg_dop]) AS [avg_dop]
+	,MIN(QSRSAL3.[min_dop]) AS [min_dop]
+	,MAX(QSRSAL3.[max_dop]) AS [max_dop]
+	,AVG(QSRSAL3.[avg_query_max_used_memory]) AS [avg_query_max_used_memory]
+	,MIN(QSRSAL3.[min_query_max_used_memory]) AS [min_query_max_used_memory]
+	,MAX(QSRSAL3.[max_query_max_used_memory]) AS [max_query_max_used_memory]
+	,SUM(QSRSAL3.[total_rowcount]) AS [total_rowcount]
+	,AVG(QSRSAL3.[avg_rowcount]) AS [avg_rowcount]
+	,MIN(QSRSAL3.[min_rowcount]) AS [min_rowcount]
+	,MAX(QSRSAL3.[max_rowcount]) AS [max_rowcount]
+	--,SUM(QSRSAL3.[total_log_bytes_used]) AS [total_log_bytes_used]
+	--,AVG(QSRSAL3.[avg_log_bytes_used]) AS [avg_log_bytes_used]
+	--,MIN(QSRSAL3.[min_log_bytes_used]) AS [min_log_bytes_used]
+	--,MAX(QSRSAL3.[max_log_bytes_used]) AS [max_log_bytes_used]
+	--,SUM(QSRSAL3.[total_tempdb_space_used]) AS [total_tempdb_space_used]
+	--,AVG(QSRSAL3.[avg_tempdb_space_used]) AS [avg_tempdb_space_used]
+	--,MIN(QSRSAL3.[min_tempdb_space_used]) AS [min_tempdb_space_used]
+	--,MAX(QSRSAL3.[max_tempdb_space_used]) AS [max_tempdb_space_used]
+INTO
+	#QueryStoreRuntimeStatsAggregatedLevel2
+FROM
+	#QueryStoreRuntimeStatsAggregatedLevel3 QSRSAL3
+GROUP BY
+	QSRSAL3.[database_id]
+	,QSRSAL3.[query_id]
+ORDER BY
+	QSRSAL3.[database_id]
+	,QSRSAL3.[query_id]
+OPTION (RECOMPILE);
+
+/*
+SELECT
+	QSRSAL2.*
+FROM
+	#QueryStoreRuntimeStatsAggregatedLevel2 QSRSAL2
+ORDER BY
+	QSRSAL2.[database_id]
+	,QSRSAL2.[query_id];
+*/
+
+-- Rank aggregations by database/query.
+SELECT
+	QSRSAL2.[database_id]
+	,QSRSAL2.[query_id]
+	,QSRSAL2.[first_execution_time]
+	,QSRSAL2.[last_execution_time]
+	,QSRSAL2.[count_executions]
+	,CASE WHEN SUM(QSRSAL2.[count_executions]) OVER () > 0 THEN CAST(QSRSAL2.[count_executions] AS float) / CAST(SUM(QSRSAL2.[count_executions]) OVER () AS float) ELSE 0 END AS [count_executions_percent]
+	,RANK() OVER (ORDER BY QSRSAL2.[count_executions] DESC) AS [count_executions_rank]
+	,QSRSAL2.[total_duration]
+	,QSRSAL2.[avg_duration]
+	,QSRSAL2.[min_duration]
+	,QSRSAL2.[max_duration]
+	,CASE WHEN SUM(QSRSAL2.[total_duration]) OVER () > 0 THEN CAST(QSRSAL2.[total_duration] AS float) / CAST(SUM(QSRSAL2.[total_duration]) OVER () AS float) ELSE 0 END AS [total_duration_percent]
+	,RANK() OVER (ORDER BY QSRSAL2.[total_duration] DESC) AS [total_duration_rank]
+	,QSRSAL2.[total_cpu_time]
+	,QSRSAL2.[avg_cpu_time]
+	,QSRSAL2.[min_cpu_time]
+	,QSRSAL2.[max_cpu_time]
+	,CASE WHEN SUM(QSRSAL2.[total_cpu_time]) OVER () > 0 THEN CAST(QSRSAL2.[total_cpu_time] AS float) / CAST(SUM(QSRSAL2.[total_cpu_time]) OVER () AS float) ELSE 0 END AS [total_cpu_time_percent]
+	,RANK() OVER (ORDER BY QSRSAL2.[total_cpu_time] DESC) AS [total_cpu_time_rank]
+	,QSRSAL2.[total_logical_io_reads]
+	,QSRSAL2.[avg_logical_io_reads]
+	,QSRSAL2.[min_logical_io_reads]
+	,QSRSAL2.[max_logical_io_reads]
+	,CASE WHEN SUM(QSRSAL2.[total_logical_io_reads]) OVER () > 0 THEN CAST(QSRSAL2.[total_logical_io_reads] AS float) / CAST(SUM(QSRSAL2.[total_logical_io_reads]) OVER () AS float) ELSE 0 END AS [total_logical_io_reads_percent]
+	,RANK() OVER (ORDER BY QSRSAL2.[total_logical_io_reads] DESC) AS [total_logical_io_reads_rank]
+	,QSRSAL2.[total_logical_io_writes]
+	,QSRSAL2.[avg_logical_io_writes]
+	,QSRSAL2.[min_logical_io_writes]
+	,QSRSAL2.[max_logical_io_writes]
+	,CASE WHEN SUM(QSRSAL2.[total_logical_io_writes]) OVER () > 0 THEN CAST(QSRSAL2.[total_logical_io_writes] AS float) / CAST(SUM(QSRSAL2.[total_logical_io_writes]) OVER () AS float) ELSE 0 END AS [total_logical_io_writes_percent]
+	,RANK() OVER (ORDER BY QSRSAL2.[total_logical_io_writes] DESC) AS [total_logical_io_writes_rank]
+	,QSRSAL2.[total_physical_io_reads]
+	,QSRSAL2.[avg_physical_io_reads]
+	,QSRSAL2.[min_physical_io_reads]
+	,QSRSAL2.[max_physical_io_reads]
+	,CASE WHEN SUM(QSRSAL2.[total_physical_io_reads]) OVER () > 0 THEN CAST(QSRSAL2.[total_physical_io_reads] AS float) / CAST(SUM(QSRSAL2.[total_physical_io_reads]) OVER () AS float) ELSE 0 END AS [total_physical_io_reads_percent]
+	,RANK() OVER (ORDER BY QSRSAL2.[total_physical_io_reads] DESC) AS [total_physical_io_reads_rank]
+	,QSRSAL2.[total_clr_time]
+	,QSRSAL2.[avg_clr_time]
+	,QSRSAL2.[min_clr_time]
+	,QSRSAL2.[max_clr_time]
+	,CASE WHEN SUM(QSRSAL2.[total_clr_time]) OVER () > 0 THEN CAST(QSRSAL2.[total_clr_time] AS float) / CAST(SUM(QSRSAL2.[total_clr_time]) OVER () AS float) ELSE 0 END AS [total_clr_time_percent]
+	,RANK() OVER (ORDER BY QSRSAL2.[total_clr_time] DESC) AS [total_clr_time_rank]
+	,QSRSAL2.[avg_dop]
+	,QSRSAL2.[min_dop]
+	,QSRSAL2.[max_dop]
+	,QSRSAL2.[avg_query_max_used_memory]
+	,QSRSAL2.[min_query_max_used_memory]
+	,QSRSAL2.[max_query_max_used_memory]
+	,QSRSAL2.[total_rowcount]
+	,QSRSAL2.[avg_rowcount]
+	,QSRSAL2.[min_rowcount]
+	,QSRSAL2.[max_rowcount]
+	,CASE WHEN SUM(QSRSAL2.[total_rowcount]) OVER () > 0 THEN CAST(QSRSAL2.[total_rowcount] AS float) / CAST(SUM(QSRSAL2.[total_rowcount]) OVER () AS float) ELSE 0 END AS [total_rowcount_percent]
+	,RANK() OVER (ORDER BY QSRSAL2.[total_rowcount] DESC) AS [total_rowcount_rank]
+	--,QSRSAL2.[total_log_bytes_used]
+	--,QSRSAL2.[avg_log_bytes_used]
+	--,QSRSAL2.[min_log_bytes_used]
+	--,QSRSAL2.[max_log_bytes_used]
+	--,CASE WHEN SUM(QSRSAL2.[total_log_bytes_used]) OVER () > 0 THEN CAST(QSRSAL2.[total_log_bytes_used] AS float) / CAST(SUM(QSRSAL2.[total_log_bytes_used]) OVER () AS float) ELSE 0 END AS [total_log_bytes_used_percent]
+	--,RANK() OVER (ORDER BY QSRSAL2.[total_log_bytes_used] DESC) AS [total_log_bytes_used_rank]
+	--,QSRSAL2.[total_tempdb_space_used]
+	--,QSRSAL2.[avg_tempdb_space_used]
+	--,QSRSAL2.[min_tempdb_space_used]
+	--,QSRSAL2.[max_tempdb_space_used]
+	--,CASE WHEN SUM(QSRSAL2.[total_tempdb_space_used]) OVER () > 0 THEN CAST(QSRSAL2.[total_tempdb_space_used] AS float) / CAST(SUM(QSRSAL2.[total_tempdb_space_used]) OVER () AS float) ELSE 0 END AS [total_tempdb_space_used_percent]
+	--,RANK() OVER (ORDER BY QSRSAL2.[total_tempdb_space_used] DESC) AS [total_tempdb_space_used_rank]
+INTO
+	#QueryStoreRuntimeStatsAggregatedRankedLevel2
+FROM
+	#QueryStoreRuntimeStatsAggregatedLevel2 QSRSAL2
+ORDER BY
+	QSRSAL2.[database_id]
+	,QSRSAL2.[query_id]
+OPTION (RECOMPILE);
+
+/*
+SELECT
+	QSRSARL2.*
+FROM
+	#QueryStoreRuntimeStatsAggregatedRankedLevel2 QSRSARL2
+ORDER BY
+	QSRSARL2.[database_id]
+	,QSRSARL2.[query_id];
+*/
+
+-- PLACEHOLDER
+
+-- Gather aggregations by database.
+SELECT
+	QSRSAL2.[database_id]
+	,MIN(QSRSAL2.[first_execution_time]) AS [first_execution_time]
+	,MAX(QSRSAL2.[last_execution_time]) AS [last_execution_time]
+	,SUM(QSRSAL2.[count_executions]) AS [count_executions]
+	,SUM(QSRSAL2.[total_duration]) AS [total_duration]
+	,AVG(QSRSAL2.[avg_duration]) AS [avg_duration]
+	,MIN(QSRSAL2.[min_duration]) AS [min_duration]
+	,MAX(QSRSAL2.[max_duration]) AS [max_duration]
+	,SUM(QSRSAL2.[total_cpu_time]) AS [total_cpu_time]
+	,AVG(QSRSAL2.[avg_cpu_time]) AS [avg_cpu_time]
+	,MIN(QSRSAL2.[min_cpu_time]) AS [min_cpu_time]
+	,MAX(QSRSAL2.[max_cpu_time]) AS [max_cpu_time]
+	,SUM(QSRSAL2.[total_logical_io_reads]) AS [total_logical_io_reads]
+	,AVG(QSRSAL2.[avg_logical_io_reads]) AS [avg_logical_io_reads]
+	,MIN(QSRSAL2.[min_logical_io_reads]) AS [min_logical_io_reads]
+	,MAX(QSRSAL2.[max_logical_io_reads]) AS [max_logical_io_reads]
+	,SUM(QSRSAL2.[total_logical_io_writes]) AS [total_logical_io_writes]
+	,AVG(QSRSAL2.[avg_logical_io_writes]) AS [avg_logical_io_writes]
+	,MIN(QSRSAL2.[min_logical_io_writes]) AS [min_logical_io_writes]
+	,MAX(QSRSAL2.[max_logical_io_writes]) AS [max_logical_io_writes]
+	,sum(QSRSAL2.[total_physical_io_reads]) AS [total_physical_io_reads]
+	,AVG(QSRSAL2.[avg_physical_io_reads]) AS [avg_physical_io_reads]
+	,MIN(QSRSAL2.[min_physical_io_reads]) AS [min_physical_io_reads]
+	,MAX(QSRSAL2.[max_physical_io_reads]) AS [max_physical_io_reads]
+	,SUM(QSRSAL2.[total_clr_time]) AS [total_clr_time]
+	,AVG(QSRSAL2.[avg_clr_time]) AS [avg_clr_time]
+	,MIN(QSRSAL2.[min_clr_time]) AS [min_clr_time]
+	,MAX(QSRSAL2.[max_clr_time]) AS [max_clr_time]
+	,AVG(QSRSAL2.[avg_dop]) AS [avg_dop]
+	,MIN(QSRSAL2.[min_dop]) AS [min_dop]
+	,MAX(QSRSAL2.[max_dop]) AS [max_dop]
+	,AVG(QSRSAL2.[avg_query_max_used_memory]) AS [avg_query_max_used_memory]
+	,MIN(QSRSAL2.[min_query_max_used_memory]) AS [min_query_max_used_memory]
+	,MAX(QSRSAL2.[max_query_max_used_memory]) AS [max_query_max_used_memory]
+	,SUM(QSRSAL2.[total_rowcount]) AS [total_rowcount]
+	,AVG(QSRSAL2.[avg_rowcount]) AS [avg_rowcount]
+	,MIN(QSRSAL2.[min_rowcount]) AS [min_rowcount]
+	,MAX(QSRSAL2.[max_rowcount]) AS [max_rowcount]
+	--,SUM(QSRSAL2.[total_log_bytes_used]) AS [total_log_bytes_used]
+	--,AVG(QSRSAL2.[avg_log_bytes_used]) AS [avg_log_bytes_used]
+	--,MIN(QSRSAL2.[min_log_bytes_used]) AS [min_log_bytes_used]
+	--,MAX(QSRSAL2.[max_log_bytes_used]) AS [max_log_bytes_used]
+	--,SUM(QSRSAL2.[total_tempdb_space_used]) AS [total_tempdb_space_used]
+	--,AVG(QSRSAL2.[avg_tempdb_space_used]) AS [avg_tempdb_space_used]
+	--,MIN(QSRSAL2.[min_tempdb_space_used]) AS [min_tempdb_space_used]
+	--,MAX(QSRSAL2.[max_tempdb_space_used]) AS [max_tempdb_space_used]
+INTO
+	#QueryStoreRuntimeStatsAggregatedLevel1
+FROM
+	#QueryStoreRuntimeStatsAggregatedLevel2 QSRSAL2
+GROUP BY
+	QSRSAL2.[database_id]
+ORDER BY
+	QSRSAL2.[database_id]
+OPTION (RECOMPILE);
+
+/*
+SELECT
+	QSRSAL1.*
+FROM
+	#QueryStoreRuntimeStatsAggregatedLevel1 QSRSAL1
+ORDER BY
+	QSRSAL1.[database_id]
+*/
+
+-- Rank aggregations by database.
+SELECT
+	QSRSAL1.[database_id]
+	,QSRSAL1.[first_execution_time]
+	,QSRSAL1.[last_execution_time]
+	,QSRSAL1.[count_executions]
+	,CASE WHEN SUM(QSRSAL1.[count_executions]) OVER () > 0 THEN CAST(QSRSAL1.[count_executions] AS float) / CAST(SUM(QSRSAL1.[count_executions]) OVER () AS float) ELSE 0 END AS [count_executions_percent]
+	,RANK() OVER (ORDER BY QSRSAL1.[count_executions] DESC) AS [count_executions_rank]
+	,QSRSAL1.[total_duration]
+	,QSRSAL1.[avg_duration]
+	,QSRSAL1.[min_duration]
+	,QSRSAL1.[max_duration]
+	,CASE WHEN SUM(QSRSAL1.[total_duration]) OVER () > 0 THEN CAST(QSRSAL1.[total_duration] AS float) / CAST(SUM(QSRSAL1.[total_duration]) OVER () AS float) ELSE 0 END AS [total_duration_percent]
+	,RANK() OVER (ORDER BY QSRSAL1.[total_duration] DESC) AS [total_duration_rank]
+	,QSRSAL1.[total_cpu_time]
+	,QSRSAL1.[avg_cpu_time]
+	,QSRSAL1.[min_cpu_time]
+	,QSRSAL1.[max_cpu_time]
+	,CASE WHEN SUM(QSRSAL1.[total_cpu_time]) OVER () > 0 THEN CAST(QSRSAL1.[total_cpu_time] AS float) / CAST(SUM(QSRSAL1.[total_cpu_time]) OVER () AS float) ELSE 0 END AS [total_cpu_time_percent]
+	,RANK() OVER (ORDER BY QSRSAL1.[total_cpu_time] DESC) AS [total_cpu_time_rank]
+	,QSRSAL1.[total_logical_io_reads]
+	,QSRSAL1.[avg_logical_io_reads]
+	,QSRSAL1.[min_logical_io_reads]
+	,QSRSAL1.[max_logical_io_reads]
+	,CASE WHEN SUM(QSRSAL1.[total_logical_io_reads]) OVER () > 0 THEN CAST(QSRSAL1.[total_logical_io_reads] AS float) / CAST(SUM(QSRSAL1.[total_logical_io_reads]) OVER () AS float) ELSE 0 END AS [total_logical_io_reads_percent]
+	,RANK() OVER (ORDER BY QSRSAL1.[total_logical_io_reads] DESC) AS [total_logical_io_reads_rank]
+	,QSRSAL1.[total_logical_io_writes]
+	,QSRSAL1.[avg_logical_io_writes]
+	,QSRSAL1.[min_logical_io_writes]
+	,QSRSAL1.[max_logical_io_writes]
+	,CASE WHEN SUM(QSRSAL1.[total_logical_io_writes]) OVER () > 0 THEN CAST(QSRSAL1.[total_logical_io_writes] AS float) / CAST(SUM(QSRSAL1.[total_logical_io_writes]) OVER () AS float) ELSE 0 END AS [total_logical_io_writes_percent]
+	,RANK() OVER (ORDER BY QSRSAL1.[total_logical_io_writes] DESC) AS [total_logical_io_writes_rank]
+	,QSRSAL1.[total_physical_io_reads]
+	,QSRSAL1.[avg_physical_io_reads]
+	,QSRSAL1.[min_physical_io_reads]
+	,QSRSAL1.[max_physical_io_reads]
+	,CASE WHEN SUM(QSRSAL1.[total_physical_io_reads]) OVER () > 0 THEN CAST(QSRSAL1.[total_physical_io_reads] AS float) / CAST(SUM(QSRSAL1.[total_physical_io_reads]) OVER () AS float) ELSE 0 END AS [total_physical_io_reads_percent]
+	,RANK() OVER (ORDER BY QSRSAL1.[total_physical_io_reads] DESC) AS [total_physical_io_reads_rank]
+	,QSRSAL1.[total_clr_time]
+	,QSRSAL1.[avg_clr_time]
+	,QSRSAL1.[min_clr_time]
+	,QSRSAL1.[max_clr_time]
+	,CASE WHEN SUM(QSRSAL1.[total_clr_time]) OVER () > 0 THEN CAST(QSRSAL1.[total_clr_time] AS float) / CAST(SUM(QSRSAL1.[total_clr_time]) OVER () AS float) ELSE 0 END AS [total_clr_time_percent]
+	,RANK() OVER (ORDER BY QSRSAL1.[total_clr_time] DESC) AS [total_clr_time_rank]
+	,QSRSAL1.[avg_dop]
+	,QSRSAL1.[min_dop]
+	,QSRSAL1.[max_dop]
+	,QSRSAL1.[avg_query_max_used_memory]
+	,QSRSAL1.[min_query_max_used_memory]
+	,QSRSAL1.[max_query_max_used_memory]
+	,QSRSAL1.[total_rowcount]
+	,QSRSAL1.[avg_rowcount]
+	,QSRSAL1.[min_rowcount]
+	,QSRSAL1.[max_rowcount]
+	,CASE WHEN SUM(QSRSAL1.[total_rowcount]) OVER () > 0 THEN CAST(QSRSAL1.[total_rowcount] AS float) / CAST(SUM(QSRSAL1.[total_rowcount]) OVER () AS float) ELSE 0 END AS [total_rowcount_percent]
+	,RANK() OVER (ORDER BY QSRSAL1.[total_rowcount] DESC) AS [total_rowcount_rank]
+	--,QSRSAL1.[total_log_bytes_used]
+	--,QSRSAL1.[avg_log_bytes_used]
+	--,QSRSAL1.[min_log_bytes_used]
+	--,QSRSAL1.[max_log_bytes_used]
+	--,CASE WHEN SUM(QSRSAL1.[total_log_bytes_used]) OVER () > 0 THEN CAST(QSRSAL1.[total_log_bytes_used] AS float) / CAST(SUM(QSRSAL1.[total_log_bytes_used]) OVER () AS float) ELSE 0 END AS [total_log_bytes_used_percent]
+	--,RANK() OVER (ORDER BY QSRSAL1.[total_log_bytes_used] DESC) AS [total_log_bytes_used_rank]
+	--,QSRSAL1.[total_tempdb_space_used]
+	--,QSRSAL1.[avg_tempdb_space_used]
+	--,QSRSAL1.[min_tempdb_space_used]
+	--,QSRSAL1.[max_tempdb_space_used]
+	--,CASE WHEN SUM(QSRSAL1.[total_tempdb_space_used]) OVER () > 0 THEN CAST(QSRSAL1.[total_tempdb_space_used] AS float) / CAST(SUM(QSRSAL1.[total_tempdb_space_used]) OVER () AS float) ELSE 0 END AS [total_tempdb_space_used_percent]
+	--,RANK() OVER (ORDER BY QSRSAL1.[total_tempdb_space_used] DESC) AS [total_tempdb_space_used_rank]
+INTO
+	#QueryStoreRuntimeStatsAggregatedRankedLevel1
+FROM
+	#QueryStoreRuntimeStatsAggregatedLevel1 QSRSAL1
+ORDER BY
+	QSRSAL1.[database_id]
+OPTION (RECOMPILE);
+
+/*
+SELECT
+	QSRSARL1.*
+FROM
+	#QueryStoreRuntimeStatsAggregatedRankedLevel1 QSRSARL1
+ORDER BY
+	QSRSARL1.[database_id];
+*/
+
+
+-- Select out our result sets starting that the database level and working down to more granular data.
+-- Select database level statistics.
+SELECT
+	QSRSARL1.[database_id]
+	,DB_NAME(QSRSARL1.[database_id]) AS [database_name]
+	,QSRSARL1.[first_execution_time] AT TIME ZONE @TimeZone AS [first_execution_time]
+	,QSRSARL1.[last_execution_time] AT TIME ZONE @TimeZone AS [last_execution_time]
+	,FORMAT(QSRSARL1.[count_executions], '#,##0', 'en-US') AS [count_executions]
+	,FORMAT(QSRSARL1.[count_executions_percent], '0.00%', 'en-US') AS [count_executions_percent]
+	,QSRSARL1.[count_executions_rank]
+	,FORMAT(QSRSARL1.[total_duration] / 1000.0, '#,##0.00', 'en-US') AS [total_duration_ms]
+	,FORMAT(QSRSARL1.[avg_duration] / 1000.0, '#,##0.00', 'en-US') AS [avg_duration_ms]
+	,FORMAT(QSRSARL1.[min_duration] / 1000.0, '#,##0.00', 'en-US') AS [min_duration_ms]
+	,FORMAT(QSRSARL1.[max_duration] / 1000.0, '#,##0.00', 'en-US') AS [max_duration_ms]
+	,FORMAT(QSRSARL1.[total_duration_percent], '0.00%', 'en-US') AS [total_duration_percent]
+	,QSRSARL1.[total_duration_rank]
+	,FORMAT(QSRSARL1.[total_cpu_time] / 1000.0, '#,##0.00', 'en-US') AS [total_cpu_time_ms]
+	,FORMAT(QSRSARL1.[avg_cpu_time] / 1000.0, '#,##0.00', 'en-US') AS [avg_cpu_time_ms]
+	,FORMAT(QSRSARL1.[min_cpu_time] / 1000.0, '#,##0.00', 'en-US') AS [min_cpu_time_ms]
+	,FORMAT(QSRSARL1.[max_cpu_time] / 1000.0, '#,##0.00', 'en-US') AS [max_cpu_time_ms]
+	,FORMAT(QSRSARL1.[total_cpu_time_percent], '0.00%', 'en-US') AS [total_cpu_time_percent]
+	,QSRSARL1.[total_cpu_time_rank]
+	,FORMAT(QSRSARL1.[total_logical_io_reads], '#,##0.00', 'en-US') AS [total_logical_io_reads]
+	,FORMAT(QSRSARL1.[avg_logical_io_reads], '#,##0.00', 'en-US') AS [avg_logical_io_reads]
+	,FORMAT(QSRSARL1.[min_logical_io_reads], '#,##0.00', 'en-US') AS [min_logical_io_reads]
+	,FORMAT(QSRSARL1.[max_logical_io_reads], '#,##0.00', 'en-US') AS [max_logical_io_reads]
+	,FORMAT(QSRSARL1.[total_logical_io_reads_percent], '0.00%', 'en-US') AS [total_logical_io_reads_percent]
+	,QSRSARL1.[total_logical_io_reads_rank]
+	,FORMAT(QSRSARL1.[total_logical_io_writes], '#,##0.00', 'en-US') AS [total_logical_io_writes]
+	,FORMAT(QSRSARL1.[avg_logical_io_writes], '#,##0.00', 'en-US') AS [avg_logical_io_writes]
+	,FORMAT(QSRSARL1.[min_logical_io_writes], '#,##0.00', 'en-US') AS [min_logical_io_writes]
+	,FORMAT(QSRSARL1.[max_logical_io_writes], '#,##0.00', 'en-US') AS [max_logical_io_writes]
+	,FORMAT(QSRSARL1.[total_logical_io_writes_percent], '0.00%', 'en-US') AS [total_logical_io_writes_percent]
+	,QSRSARL1.[total_logical_io_writes_rank]
+	,FORMAT(QSRSARL1.[total_physical_io_reads], '#,##0.00', 'en-US') AS [total_physical_io_reads]
+	,FORMAT(QSRSARL1.[avg_physical_io_reads], '#,##0.00', 'en-US') AS [avg_physical_io_reads]
+	,FORMAT(QSRSARL1.[min_physical_io_reads], '#,##0.00', 'en-US') AS [min_physical_io_reads]
+	,FORMAT(QSRSARL1.[max_physical_io_reads], '#,##0.00', 'en-US') AS [max_physical_io_reads]
+	,FORMAT(QSRSARL1.[total_physical_io_reads_percent], '0.00%', 'en-US') AS [total_physical_io_reads_percent]
+	,QSRSARL1.[total_physical_io_reads_rank]
+	,FORMAT(QSRSARL1.[total_rowcount], '#,##0.00', 'en-US') AS [total_rowcount]
+	,FORMAT(QSRSARL1.[avg_rowcount], '#,##0.00', 'en-US') AS [avg_rowcount]
+	,FORMAT(QSRSARL1.[min_rowcount], '#,##0.00', 'en-US') AS [min_rowcount]
+	,FORMAT(QSRSARL1.[max_rowcount], '#,##0.00', 'en-US') AS [max_rowcount]
+	,FORMAT(QSRSARL1.[total_rowcount_percent], '0.00%', 'en-US') AS [total_rowcount_percent]
+	,QSRSARL1.[total_rowcount_rank]
+	--,FORMAT(QSRSARL1.[total_log_bytes_used] / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [total_log_mb_used]
+	--,FORMAT(QSRSARL1.[avg_log_bytes_used] / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [avg_log_mb_used]
+	--,FORMAT(QSRSARL1.[min_log_bytes_used] / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [min_log_mb_used]
+	--,FORMAT(QSRSARL1.[max_log_bytes_used] / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [max_log_mb_used]
+	--,FORMAT(QSRSARL1.[total_log_bytes_used_percent], '0.00%', 'en-US') AS [total_log_bytes_used_percent]
+	--,QSRSARL1.[total_log_bytes_used_rank]
+	--,FORMAT(QSRSARL1.[total_tempdb_space_used] * 8192.0 / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [total_tempdb_space_used_mb]
+	--,FORMAT(QSRSARL1.[avg_tempdb_space_used] * 8192.0 / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [avg_tempdb_space_used_mb]
+	--,FORMAT(QSRSARL1.[min_tempdb_space_used] * 8192.0 / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [min_tempdb_space_used_mb]
+	--,FORMAT(QSRSARL1.[max_tempdb_space_used] * 8192.0 / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [max_tempdb_space_used_mb]
+	--,FORMAT(QSRSARL1.[total_tempdb_space_used_percent], '0.00%', 'en-US') AS [total_tempdb_space_used_percent]
+	--,QSRSARL1.[total_tempdb_space_used_rank]
+	,FORMAT(QSRSARL1.[avg_dop], '#0.00', 'en-US') AS [avg_dop]
+	,QSRSARL1.[min_dop]
+	,QSRSARL1.[max_dop]
+	,FORMAT(QSRSARL1.[avg_query_max_used_memory] * 8192.0 / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [avg_query_max_used_memory_mb]
+	,FORMAT(QSRSARL1.[min_query_max_used_memory] * 8192.0 / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [min_query_max_used_memory_mb]
+	,FORMAT(QSRSARL1.[max_query_max_used_memory] * 8192.0 / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [max_query_max_used_memory_mb]
+	,FORMAT(QSRSARL1.[total_clr_time] / 1000.0, '#,##0.00', 'en-US') AS [total_clr_time_ms]
+	,FORMAT(QSRSARL1.[avg_clr_time] / 1000.0, '#,##0.00', 'en-US') AS [avg_clr_time_ms]
+	,FORMAT(QSRSARL1.[min_clr_time] / 1000.0, '#,##0.00', 'en-US') AS [min_clr_time_ms]
+	,FORMAT(QSRSARL1.[max_clr_time] / 1000.0, '#,##0.00', 'en-US') AS [max_clr_time_ms]
+	,FORMAT(QSRSARL1.[total_clr_time_percent], '0.00%', 'en-US') AS [total_clr_time_percent]
+	,QSRSARL1.[total_clr_time_rank]
+FROM
+	#QueryStoreRuntimeStatsAggregatedRankedLevel1 QSRSARL1
+ORDER BY
+	QSRSARL1.[total_cpu_time] DESC
+OPTION (RECOMPILE);
+
+-- Select database/query level statistics.
+SELECT
+	QSRSARL2.[database_id]
+	,DB_NAME(QSRSARL2.[database_id]) AS [database_name]
+	,QSRSARL2.[query_id]
+	,QSQ.[object_id]
+	,QSQ.[schema_name]
+	,QSQ.[object_name]
+	,QSQT.[query_sql_text]
+	,QSRSARL2.[first_execution_time] AT TIME ZONE @TimeZone AS [first_execution_time]
+	,QSRSARL2.[last_execution_time] AT TIME ZONE @TimeZone AS [last_execution_time]
+	,FORMAT(QSRSARL2.[count_executions], '#,##0', 'en-US') AS [count_executions]
+	,FORMAT(QSRSARL2.[count_executions_percent], '0.00%', 'en-US') AS [count_executions_percent]
+	,QSRSARL2.[count_executions_rank]
+	,FORMAT(QSRSARL2.[total_duration] / 1000.0, '#,##0.00', 'en-US') AS [total_duration_ms]
+	,FORMAT(QSRSARL2.[avg_duration] / 1000.0, '#,##0.00', 'en-US') AS [avg_duration_ms]
+	,FORMAT(QSRSARL2.[min_duration] / 1000.0, '#,##0.00', 'en-US') AS [min_duration_ms]
+	,FORMAT(QSRSARL2.[max_duration] / 1000.0, '#,##0.00', 'en-US') AS [max_duration_ms]
+	,FORMAT(QSRSARL2.[total_duration_percent], '0.00%', 'en-US') AS [total_duration_percent]
+	,QSRSARL2.[total_duration_rank]
+	,FORMAT(QSRSARL2.[total_cpu_time] / 1000.0, '#,##0.00', 'en-US') AS [total_cpu_time_ms]
+	,FORMAT(QSRSARL2.[avg_cpu_time] / 1000.0, '#,##0.00', 'en-US') AS [avg_cpu_time_ms]
+	,FORMAT(QSRSARL2.[min_cpu_time] / 1000.0, '#,##0.00', 'en-US') AS [min_cpu_time_ms]
+	,FORMAT(QSRSARL2.[max_cpu_time] / 1000.0, '#,##0.00', 'en-US') AS [max_cpu_time_ms]
+	,FORMAT(QSRSARL2.[total_cpu_time_percent], '0.00%', 'en-US') AS [total_cpu_time_percent]
+	,QSRSARL2.[total_cpu_time_rank]
+	,FORMAT(QSRSARL2.[total_logical_io_reads], '#,##0.00', 'en-US') AS [total_logical_io_reads]
+	,FORMAT(QSRSARL2.[avg_logical_io_reads], '#,##0.00', 'en-US') AS [avg_logical_io_reads]
+	,FORMAT(QSRSARL2.[min_logical_io_reads], '#,##0.00', 'en-US') AS [min_logical_io_reads]
+	,FORMAT(QSRSARL2.[max_logical_io_reads], '#,##0.00', 'en-US') AS [max_logical_io_reads]
+	,FORMAT(QSRSARL2.[total_logical_io_reads_percent], '0.00%', 'en-US') AS [total_logical_io_reads_percent]
+	,QSRSARL2.[total_logical_io_reads_rank]
+	,FORMAT(QSRSARL2.[total_logical_io_writes], '#,##0.00', 'en-US') AS [total_logical_io_writes]
+	,FORMAT(QSRSARL2.[avg_logical_io_writes], '#,##0.00', 'en-US') AS [avg_logical_io_writes]
+	,FORMAT(QSRSARL2.[min_logical_io_writes], '#,##0.00', 'en-US') AS [min_logical_io_writes]
+	,FORMAT(QSRSARL2.[max_logical_io_writes], '#,##0.00', 'en-US') AS [max_logical_io_writes]
+	,FORMAT(QSRSARL2.[total_logical_io_writes_percent], '0.00%', 'en-US') AS [total_logical_io_writes_percent]
+	,QSRSARL2.[total_logical_io_writes_rank]
+	,FORMAT(QSRSARL2.[total_physical_io_reads], '#,##0.00', 'en-US') AS [total_physical_io_reads]
+	,FORMAT(QSRSARL2.[avg_physical_io_reads], '#,##0.00', 'en-US') AS [avg_physical_io_reads]
+	,FORMAT(QSRSARL2.[min_physical_io_reads], '#,##0.00', 'en-US') AS [min_physical_io_reads]
+	,FORMAT(QSRSARL2.[max_physical_io_reads], '#,##0.00', 'en-US') AS [max_physical_io_reads]
+	,FORMAT(QSRSARL2.[total_physical_io_reads_percent], '0.00%', 'en-US') AS [total_physical_io_reads_percent]
+	,QSRSARL2.[total_physical_io_reads_rank]
+	,FORMAT(QSRSARL2.[total_rowcount], '#,##0.00', 'en-US') AS [total_rowcount]
+	,FORMAT(QSRSARL2.[avg_rowcount], '#,##0.00', 'en-US') AS [avg_rowcount]
+	,FORMAT(QSRSARL2.[min_rowcount], '#,##0.00', 'en-US') AS [min_rowcount]
+	,FORMAT(QSRSARL2.[max_rowcount], '#,##0.00', 'en-US') AS [max_rowcount]
+	,FORMAT(QSRSARL2.[total_rowcount_percent], '0.00%', 'en-US') AS [total_rowcount_percent]
+	,QSRSARL2.[total_rowcount_rank]
+	--,FORMAT(QSRSARL2.[total_log_bytes_used] / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [total_log_mb_used]
+	--,FORMAT(QSRSARL2.[avg_log_bytes_used] / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [avg_log_mb_used]
+	--,FORMAT(QSRSARL2.[min_log_bytes_used] / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [min_log_mb_used]
+	--,FORMAT(QSRSARL2.[max_log_bytes_used] / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [max_log_mb_used]
+	--,FORMAT(QSRSARL2.[total_log_bytes_used_percent], '0.00%', 'en-US') AS [total_log_bytes_used_percent]
+	--,QSRSARL2.[total_log_bytes_used_rank]
+	--,FORMAT(QSRSARL2.[total_tempdb_space_used] * 8192.0 / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [total_tempdb_space_used_mb]
+	--,FORMAT(QSRSARL2.[avg_tempdb_space_used] * 8192.0 / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [avg_tempdb_space_used_mb]
+	--,FORMAT(QSRSARL2.[min_tempdb_space_used] * 8192.0 / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [min_tempdb_space_used_mb]
+	--,FORMAT(QSRSARL2.[max_tempdb_space_used] * 8192.0 / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [max_tempdb_space_used_mb]
+	--,FORMAT(QSRSARL2.[total_tempdb_space_used_percent], '0.00%', 'en-US') AS [total_tempdb_space_used_percent]
+	--,QSRSARL2.[total_tempdb_space_used_rank]
+	,FORMAT(QSRSARL2.[avg_dop], '#0.00', 'en-US') AS [avg_dop]
+	,QSRSARL2.[min_dop]
+	,QSRSARL2.[max_dop]
+	,FORMAT(QSRSARL2.[avg_query_max_used_memory] * 8192.0 / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [avg_query_max_used_memory_mb]
+	,FORMAT(QSRSARL2.[min_query_max_used_memory] * 8192.0 / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [min_query_max_used_memory_mb]
+	,FORMAT(QSRSARL2.[max_query_max_used_memory] * 8192.0 / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [max_query_max_used_memory_mb]
+	,FORMAT(QSRSARL2.[total_clr_time] / 1000.0, '#,##0.00', 'en-US') AS [total_clr_time_ms]
+	,FORMAT(QSRSARL2.[avg_clr_time] / 1000.0, '#,##0.00', 'en-US') AS [avg_clr_time_ms]
+	,FORMAT(QSRSARL2.[min_clr_time] / 1000.0, '#,##0.00', 'en-US') AS [min_clr_time_ms]
+	,FORMAT(QSRSARL2.[max_clr_time] / 1000.0, '#,##0.00', 'en-US') AS [max_clr_time_ms]
+	,FORMAT(QSRSARL2.[total_clr_time_percent], '0.00%', 'en-US') AS [total_clr_time_percent]
+	,QSRSARL2.[total_clr_time_rank]
+FROM
+	#QueryStoreRuntimeStatsAggregatedRankedLevel2 QSRSARL2
+	JOIN #QueryStoreQuery QSQ ON QSRSARL2.[database_id] = QSQ.[database_id] AND QSRSARL2.[query_id] = QSQ.[query_id]
+	JOIN #QueryStoreQueryText QSQT ON QSQ.[database_id] = QSQT.[database_id] AND QSQ.[query_text_id] = QSQT.[query_text_id]
+ORDER BY
+	QSRSARL2.[total_cpu_time] DESC
+OPTION (RECOMPILE);
+
+-- Select database/query/plan level statistics.
+SELECT
+	QSRSARL3.[database_id]
+	,DB_NAME(QSRSARL3.[database_id]) AS [database_name]
+	,QSRSARL3.[query_id]
+	,QSP.[plan_id]
+	,QSQ.[object_id]
+	,QSQ.[schema_name]
+	,QSQ.[object_name]
+	,QSQT.[query_sql_text]
+	,CASE WHEN @GetQueryPlanXML = 1 THEN TRY_CAST(QSP.[query_plan] AS xml) ELSE 'Skipped plan retrieval' END AS [query_plan_xml]
+	,QSRSARL3.[first_execution_time] AT TIME ZONE @TimeZone AS [first_execution_time]
+	,QSRSARL3.[last_execution_time] AT TIME ZONE @TimeZone AS [last_execution_time]
+	,FORMAT(QSRSARL3.[count_executions], '#,##0', 'en-US') AS [count_executions]
+	,FORMAT(QSRSARL3.[count_executions_percent], '0.00%', 'en-US') AS [count_executions_percent]
+	,QSRSARL3.[count_executions_rank]
+	,FORMAT(QSRSARL3.[total_duration] / 1000.0, '#,##0.00', 'en-US') AS [total_duration_ms]
+	,FORMAT(QSRSARL3.[avg_duration] / 1000.0, '#,##0.00', 'en-US') AS [avg_duration_ms]
+	,FORMAT(QSRSARL3.[min_duration] / 1000.0, '#,##0.00', 'en-US') AS [min_duration_ms]
+	,FORMAT(QSRSARL3.[max_duration] / 1000.0, '#,##0.00', 'en-US') AS [max_duration_ms]
+	,FORMAT(QSRSARL3.[total_duration_percent], '0.00%', 'en-US') AS [total_duration_percent]
+	,QSRSARL3.[total_duration_rank]
+	,FORMAT(QSRSARL3.[total_cpu_time] / 1000.0, '#,##0.00', 'en-US') AS [total_cpu_time_ms]
+	,FORMAT(QSRSARL3.[avg_cpu_time] / 1000.0, '#,##0.00', 'en-US') AS [avg_cpu_time_ms]
+	,FORMAT(QSRSARL3.[min_cpu_time] / 1000.0, '#,##0.00', 'en-US') AS [min_cpu_time_ms]
+	,FORMAT(QSRSARL3.[max_cpu_time] / 1000.0, '#,##0.00', 'en-US') AS [max_cpu_time_ms]
+	,FORMAT(QSRSARL3.[total_cpu_time_percent], '0.00%', 'en-US') AS [total_cpu_time_percent]
+	,QSRSARL3.[total_cpu_time_rank]
+	,FORMAT(QSRSARL3.[total_logical_io_reads], '#,##0.00', 'en-US') AS [total_logical_io_reads]
+	,FORMAT(QSRSARL3.[avg_logical_io_reads], '#,##0.00', 'en-US') AS [avg_logical_io_reads]
+	,FORMAT(QSRSARL3.[min_logical_io_reads], '#,##0.00', 'en-US') AS [min_logical_io_reads]
+	,FORMAT(QSRSARL3.[max_logical_io_reads], '#,##0.00', 'en-US') AS [max_logical_io_reads]
+	,FORMAT(QSRSARL3.[total_logical_io_reads_percent], '0.00%', 'en-US') AS [total_logical_io_reads_percent]
+	,QSRSARL3.[total_logical_io_reads_rank]
+	,FORMAT(QSRSARL3.[total_logical_io_writes], '#,##0.00', 'en-US') AS [total_logical_io_writes]
+	,FORMAT(QSRSARL3.[avg_logical_io_writes], '#,##0.00', 'en-US') AS [avg_logical_io_writes]
+	,FORMAT(QSRSARL3.[min_logical_io_writes], '#,##0.00', 'en-US') AS [min_logical_io_writes]
+	,FORMAT(QSRSARL3.[max_logical_io_writes], '#,##0.00', 'en-US') AS [max_logical_io_writes]
+	,FORMAT(QSRSARL3.[total_logical_io_writes_percent], '0.00%', 'en-US') AS [total_logical_io_writes_percent]
+	,QSRSARL3.[total_logical_io_writes_rank]
+	,FORMAT(QSRSARL3.[total_physical_io_reads], '#,##0.00', 'en-US') AS [total_physical_io_reads]
+	,FORMAT(QSRSARL3.[avg_physical_io_reads], '#,##0.00', 'en-US') AS [avg_physical_io_reads]
+	,FORMAT(QSRSARL3.[min_physical_io_reads], '#,##0.00', 'en-US') AS [min_physical_io_reads]
+	,FORMAT(QSRSARL3.[max_physical_io_reads], '#,##0.00', 'en-US') AS [max_physical_io_reads]
+	,FORMAT(QSRSARL3.[total_physical_io_reads_percent], '0.00%', 'en-US') AS [total_physical_io_reads_percent]
+	,QSRSARL3.[total_physical_io_reads_rank]
+	,FORMAT(QSRSARL3.[total_rowcount], '#,##0.00', 'en-US') AS [total_rowcount]
+	,FORMAT(QSRSARL3.[avg_rowcount], '#,##0.00', 'en-US') AS [avg_rowcount]
+	,FORMAT(QSRSARL3.[min_rowcount], '#,##0.00', 'en-US') AS [min_rowcount]
+	,FORMAT(QSRSARL3.[max_rowcount], '#,##0.00', 'en-US') AS [max_rowcount]
+	,FORMAT(QSRSARL3.[total_rowcount_percent], '0.00%', 'en-US') AS [total_rowcount_percent]
+	,QSRSARL3.[total_rowcount_rank]
+	--,FORMAT(QSRSARL3.[total_log_bytes_used] / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [total_log_mb_used]
+	--,FORMAT(QSRSARL3.[avg_log_bytes_used] / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [avg_log_mb_used]
+	--,FORMAT(QSRSARL3.[min_log_bytes_used] / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [min_log_mb_used]
+	--,FORMAT(QSRSARL3.[max_log_bytes_used] / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [max_log_mb_used]
+	--,FORMAT(QSRSARL3.[total_log_bytes_used_percent], '0.00%', 'en-US') AS [total_log_bytes_used_percent]
+	--,QSRSARL3.[total_log_bytes_used_rank]
+	--,FORMAT(QSRSARL3.[total_tempdb_space_used] * 8192.0 / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [total_tempdb_space_used_mb]
+	--,FORMAT(QSRSARL3.[avg_tempdb_space_used] * 8192.0 / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [avg_tempdb_space_used_mb]
+	--,FORMAT(QSRSARL3.[min_tempdb_space_used] * 8192.0 / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [min_tempdb_space_used_mb]
+	--,FORMAT(QSRSARL3.[max_tempdb_space_used] * 8192.0 / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [max_tempdb_space_used_mb]
+	--,FORMAT(QSRSARL3.[total_tempdb_space_used_percent], '0.00%', 'en-US') AS [total_tempdb_space_used_percent]
+	--,QSRSARL3.[total_tempdb_space_used_rank]
+	,FORMAT(QSRSARL3.[avg_dop], '#0.00', 'en-US') AS [avg_dop]
+	,QSRSARL3.[min_dop]
+	,QSRSARL3.[max_dop]
+	,FORMAT(QSRSARL3.[avg_query_max_used_memory] * 8192.0 / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [avg_query_max_used_memory_mb]
+	,FORMAT(QSRSARL3.[min_query_max_used_memory] * 8192.0 / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [min_query_max_used_memory_mb]
+	,FORMAT(QSRSARL3.[max_query_max_used_memory] * 8192.0 / 1024.0 / 1024.0, '#,##0.00', 'en-US') AS [max_query_max_used_memory_mb]
+	,FORMAT(QSRSARL3.[total_clr_time] / 1000.0, '#,##0.00', 'en-US') AS [total_clr_time_ms]
+	,FORMAT(QSRSARL3.[avg_clr_time] / 1000.0, '#,##0.00', 'en-US') AS [avg_clr_time_ms]
+	,FORMAT(QSRSARL3.[min_clr_time] / 1000.0, '#,##0.00', 'en-US') AS [min_clr_time_ms]
+	,FORMAT(QSRSARL3.[max_clr_time] / 1000.0, '#,##0.00', 'en-US') AS [max_clr_time_ms]
+	,FORMAT(QSRSARL3.[total_clr_time_percent], '0.00%', 'en-US') AS [total_clr_time_percent]
+	,QSRSARL3.[total_clr_time_rank]
+FROM
+	#QueryStoreRuntimeStatsAggregatedRankedLevel3 QSRSARL3
+	JOIN #QueryStoreQuery QSQ ON QSRSARL3.[database_id] = QSQ.[database_id] AND QSRSARL3.[query_id] = QSQ.[query_id]
+	JOIN #QueryStoreQueryText QSQT ON QSQ.[database_id] = QSQT.[database_id] AND QSQ.[query_text_id] = QSQT.[query_text_id]
+	JOIN #QueryStorePlan QSP ON QSRSARL3.[database_id] = QSP.[database_id] AND QSRSARL3.[plan_id] = QSP.[plan_id]
+ORDER BY
+	QSRSARL3.[database_id]
+	,QSRSARL3.[query_id]
+	,QSRSARL3.[plan_id]
+OPTION (RECOMPILE);
+
+
+DROP TABLE #QueryStoreRuntimeStats;
+DROP TABLE #QueryStorePlan;
+DROP TABLE #QueryStoreQuery;
+DROP TABLE #QueryStoreQueryText;
+DROP TABLE #QueryContextSettings;
+DROP TABLE #QueryStoreRuntimeStatsAggregatedLevel4;
+DROP TABLE #QueryStoreRuntimeStatsAggregatedRankedLevel4
+DROP TABLE #QueryStoreRuntimeStatsAggregatedLevel3;
+DROP TABLE #QueryStoreRuntimeStatsAggregatedRankedLevel3;
+DROP TABLE #QueryStoreRuntimeStatsAggregatedLevel2;
+DROP TABLE #QueryStoreRuntimeStatsAggregatedRankedLevel2;
+DROP TABLE #QueryStoreRuntimeStatsAggregatedLevel1;
+DROP TABLE #QueryStoreRuntimeStatsAggregatedRankedLevel1;
+
+-- END OF EXECUTION
+EndExecution:
+-- Clean up temp tables.
+DROP TABLE #DatabaseList;
