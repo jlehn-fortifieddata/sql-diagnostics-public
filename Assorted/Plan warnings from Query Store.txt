@@ -1,0 +1,74 @@
+;WITH XMLNAMESPACES (default 'http://schemas.microsoft.com/sqlserver/2004/07/showplan')
+,ValidQueryPlans AS
+(
+	SELECT
+		QSP.[plan_id]
+		,TRY_CAST(QSP.[query_plan] AS xml) AS [query_plan_xml]
+	FROM
+		[sys].[query_store_plan] QSP
+	WHERE
+		TRY_CAST(QSP.[query_plan] AS xml) IS NOT NULL
+)
+,PlanWarnings AS
+(
+	SELECT
+		VQP.[plan_id]
+		,CAST(W.query('local-name(.)') AS varchar) AS [warning]
+		,W.query('.') AS [node]
+	FROM
+		ValidQueryPlans VQP
+		CROSS APPLY VQP.[query_plan_xml].nodes('//Warnings/*') (W)
+)
+SELECT
+	*
+INTO
+	#PlanWarnings
+FROM
+	PlanWarnings;
+​
+SELECT
+	*
+FROM
+	#PlanWarnings;
+​
+;WITH WarningCounts AS
+(
+SELECT
+	PW.[plan_id]
+	,PW.[warning]
+	,COUNT(1) AS [warning_count]
+FROM
+	#PlanWarnings PW
+GROUP BY
+	PW.[plan_id]
+	,PW.[warning]
+)
+SELECT
+	WC.*
+	,QSP.[last_execution_time]
+	,QSQ.[count_compiles]
+	,OBJECT_SCHEMA_NAME(QSQ.[object_id]) AS [schema_name]
+	,OBJECT_NAME(QSQ.[object_id]) AS [object_name]
+	,TRY_CAST([QSP].[query_plan] AS xml) AS [query_plan_xml]
+FROM
+	WarningCounts WC
+	JOIN [sys].[query_store_plan] QSP ON WC.[plan_id] = QSP.[plan_id]
+	JOIN [sys].[query_store_query] QSQ ON QSP.[query_id] = QSQ.[query_id]
+	JOIN [sys].[query_store_query_text] QSQT ON QSQ.[query_text_id] = QSQT.[query_text_id]
+ORDER BY
+	WC.[plan_id]
+	,WC.[warning];
+​
+SELECT
+	PW.[warning]
+	,COUNT(1) AS [warning_count]
+FROM
+	#PlanWarnings PW
+GROUP BY
+	PW.[warning]
+ORDER BY
+	COUNT(1) DESC;
+​
+​
+​
+DROP TABLE #PlanWarnings;
